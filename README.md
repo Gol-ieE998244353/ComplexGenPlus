@@ -62,7 +62,7 @@ The description and visualization of each file type can be found in [pickle desc
 
 ### Environment setup with Docker
         
-        $ docker pull pytorch/pytorch:1.6.0-cuda10.1-cudnn7-devel
+        $ docker pull pytorch/pytorch:2.3.0-cuda12.1-cudnn8-devel
         $ docker run --runtime=nvidia --ipc=host --net=host -v /path/to/complexgen/:/workspace -t -i pytorch/pytorch:1.6.0-cuda10.1-cudnn7-devel
         $ cd /workspace
         $ apt-get update && apt-get install libopenblas-dev -y && conda install numpy mkl-include pytorch cudatoolkit=10.1 -c pytorch -y && apt-get install git -y && pip install git+https://github.com/NVIDIA/MinkowskiEngine.git@v0.5.0 --user
