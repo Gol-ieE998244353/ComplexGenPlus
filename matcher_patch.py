@@ -9,14 +9,14 @@ from typing import List
 from chamferdist import knn_points
 
 TList = List[Tensor]
-def chamfer_distance_patch(src_points, tgt_points, single_dir_patch_chamfer: bool, flag_batch_cd : bool):
+def chamfer_distance_patch(src_points, tgt_points, single_dir_patch_chamfer: bool, flag_batch_cd : bool): #倒角距离
     if not flag_batch_cd:    
-      pairwise_distance = torch.cdist(src_points, tgt_points, p=2.0).square()
-      assert(pairwise_distance.shape[0] > 0) #pairwise_distance.shape = [n_prediction, target_points_num, 100(10*10)]
-      s2t = pairwise_distance.min(-1).values.mean(-1)
+      pairwise_distance = torch.cdist(src_points, tgt_points, p=2.0).square() # for each batch, src (N_src, 3), tgt (N_tgt, 3) → (N_src, N_tgt)
+      assert(pairwise_distance.shape[0] > 0) #pairwise_distance.shape = [n_prediction, target_points_num, 100(10*10)] ?
+      s2t = pairwise_distance.min(-1).values.mean(-1) #first min for each src poing, then mean for all src points
       if(single_dir_patch_chamfer):
         return s2t
-      t2s = pairwise_distance.min(-2).values.mean(-1)
+      t2s = pairwise_distance.min(-2).values.mean(-1) #first min for each tgt point, then mean for all tgt points
       return (s2t + 0.2*t2s) / 1.2
     else:
       #knn version
