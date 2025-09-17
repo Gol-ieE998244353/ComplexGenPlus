@@ -2,8 +2,8 @@
 """
 Modules to compute the matching cost and solve the corresponding LSAP.
 """
-from matcher_patch import TList
 import torch
+from matcher_patch import TList
 from scipy.optimize import linear_sum_assignment
 from torch import nn, Tensor
 import numpy as np
@@ -73,14 +73,14 @@ def chamfer_distance_id(src_points, tgt_points, is_src_curve_closed):
     else:
       return closed_curve_distance_id(src_points, tgt_points)
 
-@torch.jit.script
+# @torch.jit.script
 def pairwise_shape_chamfer(src_shapes, target_shapes, gt_is_curve_closed, flag_only_open: bool):
     pairwise_distance = []
     for i in range(target_shapes.shape[0]):  #typically num_queries:100
       pairwise_distance.append(chamfer_distance(target_shapes[i].unsqueeze(0), src_shapes, gt_is_curve_closed[i], flag_only_open)) #, 
     return torch.stack(pairwise_distance).transpose(0,1)#.sqrt() #distance normalized to single point
 
-@torch.jit.script
+# @torch.jit.script
 def pairwise_shape_chamfer_id(src_shapes, target_shapes, gt_is_curve_closed):
     pairwise_distance = []
     tgt2pred_pairid = [] #to be transpose
