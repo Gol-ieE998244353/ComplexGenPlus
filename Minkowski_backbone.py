@@ -6,11 +6,11 @@ import argparse
 import time
 from datetime import datetime
 import math
-from tkinter import E
+# from tkinter import E
 import numpy
-from chamferdist import knn_points
-from chamferdist import knn_gather
-from chamferdist import list_to_padded
+from pytorch3d.ops import knn_points
+from pytorch3d.ops import knn_gather
+from pytorch3d.structures import list_to_padded
 from numpy.random.mtrand import f
 import trimesh
 
