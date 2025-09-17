@@ -66,6 +66,13 @@ The description and visualization of each file type can be found in [pickle desc
         $ sudo docker run --runtime=nvidia --ipc=host --net=host -v ~/ComplexGenPlus/:/workspace -t -i pytorch/pytorch:2.3.0-cuda12.1-cudnn8-devel
         $ cd /workspace
         $ apt-get update && apt-get install libopenblas-dev -y && conda install numpy mkl-include pytorch cudatoolkit -c pytorch -y && apt-get install git -y && pip install git+https://github.com/NVIDIA/MinkowskiEngine.git@v0.5.0 --user
+        $  git clone https://github.com/NVIDIA/MinkowskiEngine.git
+        $  MinkowskiEngine/src/3rdparty/concurrent_unordered_map.cuh: Add '#include <thrust/execution_policy.h>'
+        $  MinkowskiEngine/src/convolution_kernel.cuh: Add '#include <thrust/execution_policy.h>'
+        $  MinkowskiEngine/src/coordinate_map_gpu.cu: Add '#include <thrust/unique.h>' and '#include <thrust/remove.h>'
+        $  MinkowskiEngine/src/spmm.cu: Add '#include <thrust/execution_policy.h>', '#include <thrust/reduce.h>', and '#include <thrust/sort.h>'
+        $  cd MinkowskiEngine
+        $  python setup.py install --blas=openblas
         $ cd chamferdist && python setup.py install --user && pip install numba --user && pip install methodtools --user && pip install tensorflow-gpu --user && pip install scipy --user  && pip install rtree --user && pip install plyfile --user && pip install trimesh --user && cd ..
 
 
