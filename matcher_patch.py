@@ -6,14 +6,14 @@ import torch
 from scipy.optimize import linear_sum_assignment
 from torch import nn, Tensor
 from typing import List
-from chamferdist import knn_points
+from pytorch3d.ops import knn_points
 
 TList = List[Tensor]
 def chamfer_distance_patch(src_points, tgt_points, single_dir_patch_chamfer: bool, flag_batch_cd : bool): #倒角距离
     if not flag_batch_cd:    
       pairwise_distance = torch.cdist(src_points, tgt_points, p=2.0).square() # for each batch, src (N_src, 3), tgt (N_tgt, 3) → (N_src, N_tgt)
       assert(pairwise_distance.shape[0] > 0) #pairwise_distance.shape = [n_prediction, target_points_num, 100(10*10)] ?
-      s2t = pairwise_distance.min(-1).values.mean(-1) #first min for each src poing, then mean for all src points
+      s2t = pairwise_distance.min(-1).values.mean(-1) #first min for each src point, then mean for all src points
       if(single_dir_patch_chamfer):
         return s2t
       t2s = pairwise_distance.min(-2).values.mean(-1) #first min for each tgt point, then mean for all tgt points
@@ -21,7 +21,7 @@ def chamfer_distance_patch(src_points, tgt_points, single_dir_patch_chamfer: boo
     else:
       #knn version
       num_queries = tgt_points.shape[0]
-      src_points_batch = src_points.repeat(num_queries, 1,1)
+      src_points_batch = src_points.repeat(num_queries, 1,1) # ex. (100, 3) -> (200, 100, 3)
       src_nn = knn_points(src_points_batch, tgt_points)
       s2t_batch = src_nn.dists[...,0].mean(-1)
       if (single_dir_patch_chamfer):
