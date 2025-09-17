@@ -62,10 +62,10 @@ The description and visualization of each file type can be found in [pickle desc
 
 ### Environment setup with Docker
         
-        $ docker pull pytorch/pytorch:2.3.0-cuda12.1-cudnn8-devel
-        $ sudo docker run --runtime=nvidia --ipc=host --net=host -v ~/ComplexGenPlus/:/workspace -t -i pytorch/pytorch:2.3.0-cuda12.1-cudnn8-devel
-        $ cd /workspace
-        $ apt-get update && apt-get install libopenblas-dev -y && conda install numpy mkl-include pytorch cudatoolkit -c pytorch -y && apt-get install git -y && pip install git+https://github.com/NVIDIA/MinkowskiEngine.git@v0.5.0 --user
+        $  docker pull pytorch/pytorch:2.3.0-cuda12.1-cudnn8-devel
+        $  sudo docker run --runtime=nvidia --ipc=host --net=host -v ~/ComplexGenPlus/:/workspace -t -i pytorch/pytorch:2.3.0-cuda12.1-cudnn8-devel
+        $  cd /workspace
+        $  apt-get update && apt-get install libopenblas-dev -y && conda install numpy mkl-include pytorch cudatoolkit -c pytorch -y && apt-get install git -y && pip install git+https://github.com/NVIDIA/MinkowskiEngine.git@v0.5.0 --user
         $  git clone https://github.com/NVIDIA/MinkowskiEngine.git
         $  MinkowskiEngine/src/3rdparty/concurrent_unordered_map.cuh: Add '#include <thrust/execution_policy.h>'
         $  MinkowskiEngine/src/convolution_kernel.cuh: Add '#include <thrust/execution_policy.h>'
