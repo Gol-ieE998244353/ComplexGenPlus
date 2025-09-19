@@ -252,7 +252,8 @@ def points2sparse_voxel(points_with_normal, voxel_dim, feature_type, with_normal
     voxel_dict = {}
     voxel_length = 1.0 / voxel_dim
     voxel_coord = np.clip(np.floor(points / voxel_length).astype(np.int32), 0, voxel_dim-1)
-    points_normal_norm = linalg.norm(points_with_normal[:,3:], axis=1, keepdims=True)
+    # points_normal_norm = linalg.norm(points_with_normal[:,3:], axis=1, keepdims=True) # numba不支持numpy.linalg.norm函数
+    points_normal_norm = np.sqrt(np.sum(points_with_normal[:,3:]**2, axis=1, keepdims=True))
     points_normal_norm[points_normal_norm < th_norm] = th_norm
     if(feature_type == 'local'):
       local_coord = (points - voxel_coord.astype(np.float32)*voxel_length)*voxel_dim - 0.5
