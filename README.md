@@ -73,7 +73,8 @@ The description and visualization of each file type can be found in [pickle desc
         $  MinkowskiEngine/src/spmm.cu: Add '#include <thrust/execution_policy.h>', '#include <thrust/reduce.h>', and '#include <thrust/sort.h>'
         $  cd MinkowskiEngine
         $  python setup.py install --blas=openblas
-        $  conda install https://anaconda.org/pytorch3d/pytorch3d/0.7.7/download/linux-64/pytorch3d-0.7.7-py310_cu121_pyt231.tar.bz2&& pip install numba --user && pip install methodtools --user && pip install tensorflow --user && pip install scipy --user  && pip install rtree --user && pip install plyfile --user && pip install trimesh --user && cd ..
+        $  conda install https://anaconda.org/pytorch3d/pytorch3d/0.7.7/download/linux-64/pytorch3d-0.7.7-py310_cu121_pyt231.tar.bz2&& pip install numba --user && pip install methodtools --user && pip install tensorflow --user && pip install scipy --user  && pip install rtree --user && pip install plyfile --user && pip install trimesh --user && 
+        pip install pandas && cd ..
 
 
 **\[Note\]:** If the 'apt-get update' gets error. To solve this problem, you can firstly run command 'rm /etc/apt/sources.list.d/cuda.list' (details shown in NVIDIA/nvidia-docker#619).
@@ -130,7 +131,7 @@ The training takes about 3 days to converge.
 
 ### Environment setup
 
-        $ pip install gurobipy==9.1.2 && pip install Mosek && pip install sklearn
+        $ pip install gurobipy && pip install Mosek && pip install scikit-learn
 
 Note that you need also mannully setup [Gurobi license](https://support.gurobi.com/hc/en-us/articles/360059842732).
 
