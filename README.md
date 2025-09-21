@@ -62,18 +62,18 @@ The description and visualization of each file type can be found in [pickle desc
 
 ### Environment setup with Docker
         
-        $  docker pull pytorch/pytorch:2.3.0-cuda12.1-cudnn8-devel
-        $  sudo docker run --runtime=nvidia --ipc=host --net=host -v ~/ComplexGenPlus/:/workspace -t -i pytorch/pytorch:2.3.0-cuda12.1-cudnn8-devel
-        $  cd /workspace
-        $  apt-get update && apt-get install libopenblas-dev -y && conda install numpy mkl-include pytorch cudatoolkit -c pytorch -y && apt-get install git -y && pip install git+https://github.com/NVIDIA/MinkowskiEngine.git@v0.5.0 --user
-        $  git clone https://github.com/NVIDIA/MinkowskiEngine.git
-        $  MinkowskiEngine/src/3rdparty/concurrent_unordered_map.cuh: Add '#include <thrust/execution_policy.h>'
-        $  MinkowskiEngine/src/convolution_kernel.cuh: Add '#include <thrust/execution_policy.h>'
-        $  MinkowskiEngine/src/coordinate_map_gpu.cu: Add '#include <thrust/unique.h>' and '#include <thrust/remove.h>'
-        $  MinkowskiEngine/src/spmm.cu: Add '#include <thrust/execution_policy.h>', '#include <thrust/reduce.h>', and '#include <thrust/sort.h>'
-        $  cd MinkowskiEngine
-        $  python setup.py install --blas=openblas
-        $  conda install https://anaconda.org/pytorch3d/pytorch3d/0.7.7/download/linux-64/pytorch3d-0.7.7-py310_cu121_pyt231.tar.bz2&& pip install numba --user && pip install methodtools --user && pip install tensorflow --user && pip install scipy --user  && pip install rtree --user && pip install plyfile --user && pip install trimesh --user && 
+        docker pull pytorch/pytorch:2.3.0-cuda12.1-cudnn8-devel
+        sudo docker run --runtime=nvidia --ipc=host --net=host -v ~/ComplexGenPlus/:/workspace -t -i pytorch/pytorch:2.3.0-cuda12.1-cudnn8-devel
+        cd /workspace
+        apt-get update && apt-get install libopenblas-dev -y && conda install numpy mkl-include pytorch cudatoolkit -c pytorch -y && apt-get install git -y && pip install git+https://github.com/NVIDIA/MinkowskiEngine.git@v0.5.0 --user
+        git clone https://github.com/NVIDIA/MinkowskiEngine.git
+        MinkowskiEngine/src/3rdparty/concurrent_unordered_map.cuh: Add '#include <thrust/execution_policy.h>'
+        MinkowskiEngine/src/convolution_kernel.cuh: Add '#include <thrust/execution_policy.h>'
+        MinkowskiEngine/src/coordinate_map_gpu.cu: Add '#include <thrust/unique.h>' and '#include <thrust/remove.h>'
+        MinkowskiEngine/src/spmm.cu: Add '#include <thrust/execution_policy.h>', '#include <thrust/reduce.h>', and '#include <thrust/sort.h>'
+        cd MinkowskiEngine
+        python setup.py install --blas=openblas
+        conda install https://anaconda.org/pytorch3d/pytorch3d/0.7.7/download/linux-64/pytorch3d-0.7.7-py310_cu121_pyt231.tar.bz2&& pip install numba --user && pip install methodtools --user && pip install tensorflow --user && pip install scipy --user  && pip install rtree --user && pip install plyfile --user && pip install trimesh --user && 
         pip install pandas --user && pip install openpyxl --user && cd ..
 
 
@@ -81,7 +81,7 @@ The description and visualization of each file type can be found in [pickle desc
 
 To test if the environment is set correctly, run:
         
-        $ ./scripts/train_small.sh
+        ./scripts/train_small.sh
         
 This command will start the training of ComplexNet on a small dataset with 64 CAD models.
 
@@ -104,13 +104,13 @@ ComplexGen
 
 Then run:
 
-        $ ./scripts/test_default.sh
+        ./scripts/test_default.sh
 
 You can find network prediction of each model (\*.pkl) under _ComplexGen/experiments/default/test_obj/_. The description of each pickle file (\*.pkl) can be found [here](docs/network_prediction_pickle_description.md). 
 
 You can also get the visualizable models of corner/curve/patch of some test data by running: 
 
-        $ ./scripts/test_default_vis.sh
+        ./scripts/test_default_vis.sh
 
 A set of 3D models will be generated under _ComplexGen/experiments/default/vis_test/_ which can be visualized using 3D softwares like [MeshLab](https://www.meshlab.net/).
 
@@ -120,7 +120,7 @@ A set of 3D models will be generated under _ComplexGen/experiments/default/vis_t
 
 If you want to train ComplexNet from scratch, run:
 
-        $ ./scripts/train_default.sh
+        ./scripts/train_default.sh
 
 By default, ComplexNet is trained on a server with 8 V100 GPUs.
 You can change the numder of GPUs by setting the _--gpu_ flag in _./scripts/train\_default.sh_, and change batch size by setting the _batch_size_ flag.
@@ -131,13 +131,13 @@ The training takes about 3 days to converge.
 
 ### Environment setup
 
-        $ pip install gurobipy && pip install Mosek && pip install scikit-learn
+        pip install gurobipy && pip install Mosek && pip install scikit-learn
 
 Note that you need also mannully setup [Gurobi license](https://support.gurobi.com/hc/en-us/articles/360059842732).
 
 To conduct complex extraction, run:
 
-        $ ./scripts/extraction_default.sh
+        ./scripts/extraction_default.sh
 
 A set of complex file will be generated under _ComplexGen/experiments/default/test_obj/_. The description and visualization of complex file can be found [here](docs/complex_extraction_complex_description.md). As the average extraction time for each model is 10 minutes, we recommend you to conduct complex extraction on a multi-thread cpu server. To do this, just set _flag\_parallel_ as _True_ and _num\_parallel_ as half of the number of available threads in _ComplexGen/PostProcess/complex\_extraction.py_.
 
@@ -149,28 +149,28 @@ Code of this phase can be compiled only under Windows. If you want to build it u
 ### Environment setup
 libigl and Eigen are needed, you can install them via [vcpkg](https://github.com/microsoft/vcpkg)
 
-        $ vcpkg.exe integrate install
-        $ vcpkg.exe install libigl
-        $ vcpkg.exe install eigen3
+        vcpkg.exe integrate install
+        vcpkg.exe install libigl
+        vcpkg.exe install eigen3
 
 ### Compile and build
 The C++ project can be generated with CMake:
 
-        $ cd PATH_TO_COMPLEXGEN\GeometricRefine
-        $ mkdir build
-        $ cd build
-        $ cmake ..
+        cd PATH_TO_COMPLEXGEN\GeometricRefine
+        mkdir build
+        cd build
+        cmake ..
 
 Then you can build _GeometricRefine.sln_ with Visual Studio. After that, you'll find _GeometricRefine.exe_ under _PATH_TO_COMPLEXGEN/GeometricRefine/Bin_.
 
 To conduct geometric refinement for all models, please first modify _.\scripts\geometric_refine.py_ by setting 'pc_ply_path' as the path containing the input point cloud stored in _.ply_ format, and setting 'complex_path' as the path containing the results of complex extraction, then run:
 
-        $ cd PATH_TO_COMPLEXGEN
-        $ python .\scripts\geometric_refine.py
+        cd PATH_TO_COMPLEXGEN
+        python .\scripts\geometric_refine.py
 
 If you are processing noisy/partial data, please replace the second command with:
 
-        $ python .\scripts\geometric_refine.py --noise
+        python .\scripts\geometric_refine.py --noise
 
 You will find the generate json files under 'complex_path'. Description of the generated json file can be found  [here](docs/geometric_refinement_json_description.md)
 
@@ -178,7 +178,7 @@ You will find the generate json files under 'complex_path'. Description of the g
 
 The evaluation is conducted under Linux. To evaluate the final output of ComplexGen, run:
 
-        $ ./scripts/eval_default.sh
+        ./scripts/eval_default.sh
 
 You can find the metrics of each model and all models in _ComplexGen/experiments/default/test_obj/final_evaluation_geom_refine.xlsx_.
 
@@ -186,8 +186,8 @@ You can find the metrics of each model and all models in _ComplexGen/experiments
 
 We provide tools for converting our generated complex file or json file to obj files which can be visualized with [MeshLab](https://www.meshlab.net/):
         
-        $ cd vis
-        $ python gen_vis_result.py -i PATH_TO_COMPLEX/JSON_FILE
+        cd vis
+        python gen_vis_result.py -i PATH_TO_COMPLEX/JSON_FILE
 
 Remember to copy _./vis/complexgen.mtl_ to the target folder containing the complex/json file. Corners of the reconstructed B-Rep are shown in yellow, curves in blue and patches in different colors.
 
