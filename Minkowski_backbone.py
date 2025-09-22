@@ -4177,8 +4177,8 @@ def eval_pipeline(flag_eval = True):
     return model_evaluation_complex(model_without_ddp, corner_loss_criterion, curve_loss_criterion, patch_loss_criterion, train_data, device, start_iterations, flag_output = not args.no_output)
 
 def pipeline_abc(rank, world_size):
-  torch.autograd.set_detect_anomaly(True)
-  dist.init_process_group(backend='nccl', init_method='tcp://127.0.0.1:23257', world_size=world_size, rank=rank)
+  torch.autograd.set_detect_anomaly(True) #启动自动求导异常检测
+  dist.init_process_group(backend='nccl', init_method='tcp://127.0.0.1:23257', world_size=world_size, rank=rank) #指定nccl后端，torch.distributed
   assert(is_dist_avail_and_initialized())
   assert(get_world_size() == world_size)
   # fix the seed for reproducibility
