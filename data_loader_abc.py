@@ -19,7 +19,7 @@ pack_size = 10000
 th_norm = 1e-6
 points_per_curve_dim = 34
 
-def pack_pickle_files(data_folder, packed_data_folder):
+def pack_pickle_files(data_folder, packed_data_folder): # 按需求将data_folder下的pkl文件打包成packed_data_folder下的多个大pkl文件(以pack_size为单位)
   print("load data from {} and packing data to {}".format(data_folder, packed_data_folder))
   files = os.listdir(data_folder)
   random.shuffle(files)
@@ -70,17 +70,17 @@ def data_loader_ABC(data_folder, ignore_inpatch_curves=True):
   def patch_type_to_id(str):
     #Cylinder, Torus, BSpline, Plane, Cone, Sphere
     #update: add Extrusion and Revolution, label same as BSpline
-    if(str == 'Cylinder'):
+    if(str == 'Cylinder'): #圆柱体
       return 0
-    if(str == 'Torus'):
+    if(str == 'Torus'):#环面
       return 1
     if(str == 'BSpline' or str == 'Extrusion' or str == 'Revolution'):
       return 2
-    if(str == 'Plane'):
+    if(str == 'Plane'):#平面
       return 3
-    if(str == 'Cone'):
+    if(str == 'Cone'):#圆锥
       return 4
-    assert(str == 'Sphere')
+    assert(str == 'Sphere')#球体
     return 5
   
   total_valid_corners = 0
@@ -106,6 +106,10 @@ def data_loader_ABC(data_folder, ignore_inpatch_curves=True):
   patch_area_stat = []
   
   files = os.listdir(data_folder)
+  # print("######")
+  # print(data_folder)
+  # print(files)
+  # print("######")
   for file in files:
     if(not file.endswith(".pkl")):
       continue
@@ -113,7 +117,7 @@ def data_loader_ABC(data_folder, ignore_inpatch_curves=True):
     while(True):
       #load data from pkl file
       try:
-        sample = pickle.load(rf)
+        sample = pickle.load(rf) # 文件指针后移; read 后变成 numpy.ndarray
       except EOFError:
         break
       if(read_from_packed_pkl):
@@ -131,7 +135,7 @@ def data_loader_ABC(data_folder, ignore_inpatch_curves=True):
         print('point cloud out of bound for model: ', file)
         continue
 
-      assert(processed_sample['surface_points'][:,:3].min() > -0.55 and processed_sample['surface_points'][:,:3].max() < 0.55)
+      assert(processed_sample['surface_points'][:,:3].min() > -0.55 and processed_sample['surface_points'][:,:3].max() < 0.55) # clip 一下表面点范围
       if(visualize_training_samples and file_count < 100):
         np.savetxt(file.replace(".pkl", ".surface.samples.xyz"), processed_sample['surface_points'])
       
@@ -158,8 +162,8 @@ def data_loader_ABC(data_folder, ignore_inpatch_curves=True):
         processed_curve['is_closed'] = curve['is_closed']
         if(not curve['is_closed']):
           if(not curve['start_vert_idx'] in corner_vert_idx):
-            corner_vert_idx.append(curve['start_vert_idx'])
-            corner_position.append(processed_curve['points'][0])
+            corner_vert_idx.append(curve['start_vert_idx']) #将曲线第一个点的顶点index加入corner_vert_idx
+            corner_position.append(processed_curve['points'][0]) #将曲线第一个点的坐标加入corner_position
           if(not curve['end_vert_idx'] in corner_vert_idx):
             corner_vert_idx.append(curve['end_vert_idx'])
             corner_position.append(processed_curve['points'][-1])
@@ -177,14 +181,15 @@ def data_loader_ABC(data_folder, ignore_inpatch_curves=True):
       if(short_curves):
         print("short curves detected in", file)
         continue
-      processed_sample['corners'] = np.array(corner_position)
+      processed_sample['corners'] = np.array(corner_position) #曲线首末点
+      # print(processed_curve['corners'])
       total_valid_corners += len(processed_sample['corners'])
       total_valid_curves += len(processed_sample['curves'])
       if(len(processed_sample['curves']) < min_number_of_curves): min_number_of_curves = len(processed_sample['curves'])
       if(processed_sample['corners'].shape[0] > max_number_of_corners):
         max_number_of_corners = processed_sample['corners'].shape[0]
       if(processed_sample['corners'].shape[0] == 0):
-        processed_sample['corners'] = np.zeros([0,3], dtype=np.float32)
+        processed_sample['corners'] = np.zeros([0,3], dtype=np.float32) #保持3的形状
       
       curve_occur_dict = {}
       total_patches += len(sample['patches'])
@@ -193,7 +198,7 @@ def data_loader_ABC(data_folder, ignore_inpatch_curves=True):
         processed_patch = {}
         processed_patch['type'] = patch_type_to_id(patch['type'])
         processed_patch['curves'] = patch['curves']
-        for patch_curve_idx in processed_patch['curves']:
+        for patch_curve_idx in processed_patch['curves']: #idx is a number
           if(patch_curve_idx in curve_occur_dict):
             curve_occur_dict[patch_curve_idx] += 1
           else:
@@ -247,37 +252,35 @@ def data_loader_ABC(data_folder, ignore_inpatch_curves=True):
 
 # @numba.jit()        
 def points2sparse_voxel(points_with_normal, voxel_dim, feature_type, with_normal, pad1s):
-    #covert to COO format, assume input points is already normalize to [-0.5 0.5]
-    points = points_with_normal[:,:3] + 0.5
+    #covert to COO format, assume input points is already normalize to [-0.5 0.5] ?? maybe not while adding noise
+    points = points_with_normal[:,:3] + 0.5 #to [0 1]
     voxel_dict = {}
     voxel_length = 1.0 / voxel_dim
-    voxel_coord = np.clip(np.floor(points / voxel_length).astype(np.int32), 0, voxel_dim-1)
+    voxel_coord = np.clip(np.floor(points / voxel_length).astype(np.int32), 0, voxel_dim-1) # clip to avoid out of range
     points_normal_norm = linalg.norm(points_with_normal[:,3:], axis=1, keepdims=True) # numba不支持norm函数
-    # points_normal_norm = np.sqrt(np.sum(points_with_normal[:,3:]**2, axis=1, keepdims=True))
     points_normal_norm[points_normal_norm < th_norm] = th_norm
     if(feature_type == 'local'):
-      local_coord = (points - voxel_coord.astype(np.float32)*voxel_length)*voxel_dim - 0.5
-      local_coord = np.concatenate([local_coord, points_with_normal[:,3:] / points_normal_norm, np.ones([local_coord.shape[0], 1])], axis=-1)
-    elif(feature_type == 'global'):
+      local_coord = (points - voxel_coord.astype(np.float32)*voxel_length)*voxel_dim - 0.5 # 体素内的坐标[-0.5 0.5]
+      local_coord = np.concatenate([local_coord, points_with_normal[:,3:] / points_normal_norm, np.ones([local_coord.shape[0], 1])], axis=-1) #体素内坐标+归一化法向量+1
+    elif(feature_type == 'global'): #直接用全局坐标
       local_coord = points - 0.5
       local_coord = np.concatenate([local_coord, points_with_normal[:,3:] / points_normal_norm, np.ones([local_coord.shape[0], 1])], axis=-1)
     
     stat_voxel_dict = {}
-    
-    for i in range(voxel_coord.shape[0]):
+    for i in range(voxel_coord.shape[0]): # 将所有点分配到体素中
       coord_tuple = (voxel_coord[i,0], voxel_coord[i,1], voxel_coord[i,2])
       if(coord_tuple not in voxel_dict):
         voxel_dict[coord_tuple] = local_coord[i]
       else:
-        voxel_dict[coord_tuple] += local_coord[i]
+        voxel_dict[coord_tuple] += local_coord[i] # 体素内的特征直接相加
     
     locations = np.array(list(voxel_dict.keys()))
-    features = np.array(list(voxel_dict.values()))
+    features = np.array(list(voxel_dict.values())) # 展平，将所有特征堆叠[N,7]
     points_in_voxel = features[:,6:]
     features = features / points_in_voxel #pad ones
     position = features[:,:3]
     normals = features[:,3:6]
-    pad_ones = features[:,6:]
+    pad_ones = features[:,6:] # use count of points in voxel as feature ? must be one
     normals /= linalg.norm(normals, axis=-1, keepdims=True) + 1e-10
     
     '''
@@ -305,11 +308,10 @@ def points2sparse_voxel(points_with_normal, voxel_dim, feature_type, with_normal
       features = np.concatenate([position, normals], axis=1)
     else:
       features = position
-    
     return locations.astype(np.int32), features.astype(np.float32)
 
 
-def points2sparse_voxel_mink(points_with_normal, voxel_dim, feature_type, with_normal, pad1s):
+def points2sparse_voxel_mink(points_with_normal, voxel_dim, feature_type, with_normal, pad1s): # no used
     """
       Use Minkowski Engine's native sparse tensorfield algorithm to voxelize the point cloud.
     """
@@ -332,7 +334,7 @@ def points2sparse_voxel_mink(points_with_normal, voxel_dim, feature_type, with_n
     return sinput.coordinates_at(0).numpy().astype(np.int32), sinput.features_at(0).numpy().astype(np.float32)
 
 
-def jitter_point_cloud(batch_data, sigma=0.01, clip=0.05):
+def jitter_point_cloud(batch_data, sigma=0.01, clip=0.05): # no used
     """ Randomly jitter points. jittering is per point.
       Input:
         BxNx3 array, original batch of point clouds
@@ -351,15 +353,15 @@ r_normal_noise = 0.2
 class ABCDataset(torch.utils.data.Dataset):
     def __init__(self, data, voxel_dim, feature_type='local', pad1s=True, random_rotation=False, random_angle = False, with_normal=True, flag_quick_test = False, flag_noise = 0, flag_grid = False, num_angles = 4, flag_patch_uv = False, flag_backbone = False, dim_grid = 10, eval_res_cov = False):
         self.data = data
-        self.voxel_dim = voxel_dim
-        self.feature_type = feature_type
+        self.voxel_dim = voxel_dim # 将点云头投到[voxel_dim, voxel_dim, voxel_dim]的体素网格中[-1,1] -> [0,32] 按一定比例乘积后取整
+        self.feature_type = feature_type 
         assert(self.feature_type == 'global' or self.feature_type == 'local' or self.feature_type == 'occupancy')
         self.pad1s = pad1s
         self.random_rotation_augmentation = random_rotation
         self.random_angle = random_angle
         if(self.random_rotation_augmentation): print("enable rotation augmentation")
         self.with_normal = with_normal
-        self.flag_quick_test = flag_quick_test
+        self.flag_quick_test = flag_quick_test #no used
         self.flag_noise = flag_noise
         self.flag_grid = flag_grid
         self.num_angles = num_angles
@@ -383,7 +385,7 @@ class ABCDataset(torch.utils.data.Dataset):
         for i in range(4):
           self.fourteen_mat.append( np.matmul(R.from_rotvec((np.pi/2 * i + np.pi / 4) * np.array([0,0,1])).as_matrix(), cornerrot2).transpose() )
         if(self.with_normal): print("normal is included in input signal")
-        
+        # y轴4个旋转，0°, 90°, 180°, 270°，x轴两个90°，270°；先绕z轴转45°, 135°, 225°, 315°，再绕y轴转arccos(√3/3)和-arccos(√3/3) 54.745°
         '''
         #compute covariance matrix in advance
         for i in range(len(self.data)):
@@ -438,33 +440,33 @@ class ABCDataset(torch.utils.data.Dataset):
             sigma = 0.05 
 
           clip= 5.0 * sigma
-          jittered_data_pts = np.clip(sigma * np.random.randn(item_points.shape[0],3), -1 * clip, clip)
+          jittered_data_pts = np.clip(sigma * np.random.randn(item_points.shape[0],3), -1 * clip, clip) #随机生成n个3的高斯噪声，在clip中截断,N(0,sigma^2),clip=5*sigma 10sigma偏差过大
           item_points[:,:3] = item_points[:,:3] + jittered_data_pts
-
+          
           if flag_normal_noise:
-            normal_noise = np.random.random_sample((item_points.shape[0],3)) *2 -1
-            normal_noise_norm = np.linalg.norm(normal_noise, axis =-1).reshape(-1,1)
-            normal_noise_norm[normal_noise_norm < th_norm] = th_norm
-            normal_noise = normal_noise / normal_noise_norm
-            new_normal = item_points[:,3:] + normal_noise * r_normal_noise
+            normal_noise = np.random.random_sample((item_points.shape[0],3)) *2 -1 #均匀分布在[-1,1]的随机噪声
+            normal_noise_norm = np.linalg.norm(normal_noise, axis =-1).reshape(-1,1) #将噪声变成长度N的向量，然后变成[N,1]的形式,axis=-1最后一维
+            normal_noise_norm[normal_noise_norm < th_norm] = th_norm #防止极小值，th_norm=1e-6
+            normal_noise = normal_noise / normal_noise_norm #可能出现分母略小于1，大部分=1
+            new_normal = item_points[:,3:] + normal_noise * r_normal_noise #限制抖动范围
             new_normal_norm = np.linalg.norm(new_normal, axis = -1).reshape(-1,1)
             new_normal_norm[new_normal_norm < th_norm] = th_norm
-            item_points[:, 3:] = new_normal / new_normal_norm
-
+            item_points[:, 3:] = new_normal / new_normal_norm #法向量必须保持单位长度
+        # print("item_points[:, :3] =\n", item_points[:, :3])
         patches = copy.deepcopy(sample_data['patches'])
         if self.eval_res_cov:
           for patch_idx in range(len(patches)):
             tmp_patch_pc = patches[patch_idx]['patch_points'].reshape(-1, 6)[:, :3].astype(np.float32) #not using normal
-            patches[patch_idx]['patch_pc'] = tmp_patch_pc
+            patches[patch_idx]['patch_pc'] = tmp_patch_pc #新存一个三维点坐标
 
         if(self.random_rotation_augmentation):
-          if not self.random_angle:
+          if not self.random_angle: #非随机旋转角度
             if self.num_angles == 4:
-              rot_z = R.from_rotvec(np.pi/2 * random.randint(0,3) * np.array([0,0,1])).as_matrix()
+              rot_z = R.from_rotvec(np.pi/2 * random.randint(0,3) * np.array([0,0,1])).as_matrix() # 绕z轴旋转
               rot = rot_z
             elif self.num_angles == 56:
               rot = self.fourteen_mat[random.randint(0,13)]
-              rot_z = R.from_rotvec(np.pi/2 * random.randint(0,3) * np.array([0,0,1])).as_matrix()
+              rot_z = R.from_rotvec(np.pi/2 * random.randint(0,3) * np.array([0,0,1])).as_matrix() # 绕z轴旋转再绕14个方向
               rot = np.matmul(rot_z, rot)
             elif self.num_angles == 14:
               rot = self.fourteen_mat[random.randint(0,13)]
@@ -474,7 +476,7 @@ class ABCDataset(torch.utils.data.Dataset):
               sinval = np.sin(rotation_angle)
               rot = np.array([[cosval, 0, sinval],
                                     [0, 1, 0],
-                                    [-sinval, 0, cosval]])
+                                    [-sinval, 0, cosval]]) #绕y轴旋转
           else:
             rot = R.random().as_matrix()
 
@@ -482,10 +484,10 @@ class ABCDataset(torch.utils.data.Dataset):
           item_points = np.dot(item_points, rot) #apply the transform
           item_points = np.reshape(item_points, [-1,6])
           if self.flag_backbone:
-            item_points_ori = np.reshape(item_points_ori, [-1,3])
+            item_points_ori = np.reshape(item_points_ori, [-1,3]) #没有加位置噪声和法向量噪声
             item_points_ori = np.dot(item_points_ori, rot) #apply the transform, save as matmul
             item_points_ori = np.reshape(item_points_ori, [-1,6])
-          corners = np.dot(corners, rot)
+          corners = np.dot(corners, rot) # 这样不会改变原数据，np.dot会生成一个new的数据
           for curve in curves:
             curve['points'] = np.matmul(curve['points'], rot)
           
@@ -497,20 +499,22 @@ class ABCDataset(torch.utils.data.Dataset):
           
           if self.eval_res_cov:
             for patch_idx in range(len(patches)):
-              patches[patch_idx]['patch_pc'] = np.dot(patches[patch_idx]['patch_pc'], rot).astype(np.float32)
-                        
-        if not self.flag_grid:
+              patches[patch_idx]['patch_pc'] = np.dot(patches[patch_idx]['patch_pc'], rot).astype(np.float32) #旋转patch
+        # print(self.flag_grid)
+        # for i, patch in enumerate(patches):
+        #     print(f"\n{'='*30} PATCH {i} patch_points shape: {patch['patch_points'].shape} {'='*30}\n")
+        if not self.flag_grid: #maybe not used
           for patch_idx in range(len(patches)):
             #might not work for noisy case, cause the pred patch depends on the input points
-            patches[patch_idx]['patch_points'] = item_points[patches[patch_idx]['patch_points']]
+            patches[patch_idx]['patch_points'] = item_points[patches[patch_idx]['patch_points']] #直接从旋转的点云中取点
             assert(len(patches[patch_idx]['patch_points'].shape) == 2 and patches[patch_idx]['patch_points'].shape[1] == 6)
             
             patches[patch_idx]['patch_normals'] = patches[patch_idx]['patch_points'][:,3:].astype(np.float32)
             patch_normal_norm = np.linalg.norm(patches[patch_idx]['patch_normals'], axis = -1).reshape(-1,1)
             patch_normal_norm[patch_normal_norm < th_norm] = th_norm
-            patches[patch_idx]['patch_normals'] = patches[patch_idx]['patch_normals']/ patch_normal_norm
-
-            patches[patch_idx]['patch_points'] = patches[patch_idx]['patch_points'][:,:3].astype(np.float32)
+            patches[patch_idx]['patch_normals'] = patches[patch_idx]['patch_normals']/ patch_normal_norm # 法向量归一
+ 
+            patches[patch_idx]['patch_points'] = patches[patch_idx]['patch_points'][:,:3].astype(np.float32) 
         else:
           #rotation
           for patch_idx in range(len(patches)):
@@ -528,7 +532,6 @@ class ABCDataset(torch.utils.data.Dataset):
         if self.flag_backbone:
           locations_ori, features_ori = points2sparse_voxel(item_points_ori, self.voxel_dim, self.feature_type, self.with_normal, self.pad1s)
           return (locations, features, locations_ori, features_ori, sample_data['filename'])
-
         return (locations, features, corners.astype(np.float32), curves, patches, sample_data['filename'], item_points)
 
 
@@ -544,21 +547,21 @@ def train_data_loader(batch_size=32, voxel_dim=128, feature_type='local', pad1s=
     result = {}
     if(len(curves) != 0):
       labels = [curve['type'] for curve in curves]
-      geometry = [np.reshape(curve['points'], [1, -1, 3]) for curve in curves]
+      geometry = [np.reshape(curve['points'], [1, -1, 3]) for curve in curves] # one curve must be 34 points or 3 * 34 points
       is_closed = [curve['is_closed'] for curve in curves]
       endpoints = [curve['endpoints'] for curve in curves]
       curve_length = [(curve['curve_length']**2) / average_squared_curve_length if (curve['curve_length']**2) / average_squared_curve_length > 0.001 else 0.001 for curve in curves]
       result['labels'] = torch.from_numpy(np.array(labels, dtype=np.int64))#.to(device)
-      curve_points = torch.from_numpy(np.concatenate(geometry, axis=0).astype(np.float32))#.to(device) 
+      curve_points = torch.from_numpy(np.concatenate(geometry, axis=0).astype(np.float32))#.to(device) [n(array),34,3]->[1,34,3]->[n,34,3](tensor)
       if curve_points.shape[1] != points_per_curve_dim:
         curve_points = curve_points[:, ::3] #sample 34 points
       result['curve_points'] = curve_points
       result['is_closed'] = torch.from_numpy(np.array(is_closed, dtype=np.int64))#.to(device)
       result['endpoints'] = torch.from_numpy(np.array(endpoints, dtype=np.int64))#.to(device)
       result['curve_length_weighting'] = torch.from_numpy(1.0 / np.array(curve_length, dtype=np.float32))
-      result['curve_length_weighting'] /= result['curve_length_weighting'].mean()
+      result['curve_length_weighting'] /= result['curve_length_weighting'].mean()  # short value curves have large weights
     else:
-      result['labels'] = torch.zeros([0], dtype=torch.long)#, device=device
+      result['labels'] = torch.zeros([0], dtype=torch.long)#, device=device simulate empty
       result['curve_points'] = torch.zeros([0, 34, 3], dtype=torch.float32)
       result['is_closed'] = torch.zeros([0], dtype=torch.long)
       result['endpoints'] = torch.zeros([0,2], dtype=torch.long)
@@ -582,41 +585,41 @@ def train_data_loader(batch_size=32, voxel_dim=128, feature_type='local', pad1s=
       patch_pcs = [torch.from_numpy(patch['patch_pc']) for patch in patches]
       result['patch_pcs'] = patch_pcs 
 
-    result['patch_curve_correspondence'] = patch_curve_correspondence
+    result['patch_curve_correspondence'] = patch_curve_correspondence # 面与线的对应关系
     result['patch_area_weighting'] = torch.from_numpy(1.0 / np.array(patch_area, dtype=np.float32))
     result['patch_area_weighting'] /= result['patch_area_weighting'].mean()
 
-    if flag_patch_uv or flag_grid:
+    if flag_patch_uv or flag_grid: # both need uv directions
       u_closed = [patch['u_closed'] for patch in patches]
       v_closed = [patch['v_closed'] for patch in patches]
-      assert(not (u_closed == False and v_closed == True))
+      assert(not (u_closed == False and v_closed == True)) #如不研究莫比乌斯环
       result['u_closed'] = torch.from_numpy(np.array(u_closed, dtype=np.int64))#.to(device)\
       result['v_closed'] = torch.from_numpy(np.array(v_closed, dtype=np.int64))#.to(device)
 
     return result
   
-  def collate_function(tensorlist):
+  def collate_function(tensorlist): #样一个tensorlist是很多__getitem__返回的tensorlist的组合（具体多少个由DataLoader传入参数决定）,locations i表示一个是同一个batch的第几个样本
     #first call __getitem__ then this function
     batch_size = len(tensorlist)
-    locations = [np.concatenate([tensorlist[i][0], np.ones([tensorlist[i][0].shape[0], 1], dtype=np.int32)*i], axis=-1) for i in range(batch_size)]
+    locations = [np.concatenate([tensorlist[i][0], np.ones([tensorlist[i][0].shape[0], 1], dtype=np.int32)*i], axis=-1) for i in range(batch_size)] #稀疏体素三维坐标，最后加一个编号
     features = [tensorlist[i][1] for i in range(batch_size)]
     if flag_backbone:
       locations_ori = [np.concatenate([tensorlist[i][2], np.ones([tensorlist[i][2].shape[0], 1], dtype=np.int32)*i], axis=-1) for i in range(batch_size)]
       features_ori = [tensorlist[i][3] for i in range(batch_size)]
-      input_sample_idx = [tensorlist[i][4] for i in range(batch_size)]
+      sample_data = [tensorlist[i][4] for i in range(batch_size)]
       return torch.from_numpy(np.concatenate(locations, axis=0)), torch.from_numpy(np.concatenate(features, axis=0)),\
-      torch.from_numpy(np.concatenate(locations_ori, axis=0)), torch.from_numpy(np.concatenate(features_ori, axis=0)),input_sample_idx
+      torch.from_numpy(np.concatenate(locations_ori, axis=0)), torch.from_numpy(np.concatenate(features_ori, axis=0)),sample_data ## 多个稀疏的向量全部拼成一列，转成torch
 
-    corner_points = [np.reshape(tensorlist[i][2], [-1,3]) for i in range(batch_size)]
+    corner_points = [np.reshape(tensorlist[i][2], [-1,3]) for i in range(batch_size)] # 将一个批次所有corner点拼起来
     corner_batch_idx = [np.ones(tensorlist[i][2].shape[0], dtype=np.int32)*i for i in range(batch_size)]
     curves = [pack_curve_list(tensorlist[i][3]) for i in range(batch_size)]
     patches = [pack_patch_list(tensorlist[i][4], len(tensorlist[i][3])) for i in range(batch_size)]
-    input_sample_idx = [tensorlist[i][5] for i in range(batch_size)]
+    sample_data = [tensorlist[i][5] for i in range(batch_size)]
     input_pointcloud = [tensorlist[i][6] for i in range(batch_size)] #np.stack(
-    #.to(device)
+    #.to(device) classical pointcloud
     return torch.from_numpy(np.concatenate(locations, axis=0)), torch.from_numpy(np.concatenate(features, axis=0)),\
            torch.from_numpy(np.concatenate(corner_points, axis=0)), torch.from_numpy(np.concatenate(corner_batch_idx, axis=0)),\
-           input_pointcloud, input_sample_idx, curves, patches, tensorlist[0][1]
+           input_pointcloud, sample_data, curves, patches, tensorlist[0][1]
   
   if not os.path.exists(os.path.join(data_folder, "packed")):
     os.mkdir(os.path.join(data_folder, "packed"))
