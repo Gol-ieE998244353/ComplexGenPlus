@@ -19,6 +19,7 @@ from torch.cuda.amp import autocast, GradScaler
 from Minkowski_backbone import (
     get_args_parser,
     voxel_dim,
+    points_per_curve,
     points_per_patch_dim,
     num_of_gpus,
     MLP,
@@ -29,29 +30,26 @@ from data_loader_abc import *
 
 class Config:
     # Model Architecture
-    D_MODEL = 384
+    D_MODEL = 384 
     NHEAD = 8
     NUM_LAYERS = 6
     DIM_FEEDFORWARD = 1024
-    DROPOUT = 0.1
+    DROPOUT = 0.05
 
     # Latent Space
     CURVE_LATENT_DIM = 256
     PATCH_LATENT_DIM = 256
 
     # Data
-    CURVE_NUM_POINTS = 34
     PATCH_NUM_POINTS = 400
     POINTS_PER_PATCH_DIM = 20
     MAX_CURVES = 100
-    MAX_PATCHES = 50
-
+    MAX_PATCHES = 50 
     # HyperNetwork
-    HN_PE_DIM = 32
+    HN_PE_DIM = 64
     HN_MLP_DIM = 128
 
     # Position Encoding
-    VOXEL_DIM = 128
     PE_TEMPERATURE = 10000
     PE_SCALE = 2 * math.pi
 
@@ -62,21 +60,19 @@ class Config:
     # VAE
     KL_WEIGHT_START = 0.0
     KL_WEIGHT_END = 0.1
-    KL_WARMUP_EPOCHS = 10
+    KL_WARMUP_EPOCHS = 20
 
     # Training Optimization
     LEARNING_RATE = 5e-4
     WEIGHT_DECAY = 1e-5
     GRAD_CLIP_NORM = 1.0
-    EVAL_INTERVAL = 10
-    SAVE_INTERVAL = 10
+    EVAL_INTERVAL = 50
+    SAVE_INTERVAL = 50
     
     # Performance Optimization
     USE_AMP = False  # Mixed precision training
-    GRADIENT_ACCUMULATION_STEPS = 4  # Accumulate gradients
-    DATALOADER_PREFETCH_FACTOR = 2  # Prefetch batches
-    DATALOADER_PERSISTENT_WORKERS = True  # Keep workers alive
-    LOG_INTERVAL = 100  # Log every N batches to reduce sync
+    GRADIENT_ACCUMULATION_STEPS = 2  # Accumulate gradients
+    LOG_INTERVAL = 200  # Log every N batches to reduce sync
 
     # Loss weights
     RECON_WEIGHT = 1.0
@@ -195,7 +191,7 @@ class CurveEncoder(nn.Module):
         self.config = config
 
         self.geom_encoder = PointNetEncoder(
-            input_dim=3, output_dim=config.D_MODEL // 4, dropout=config.DROPOUT
+            input_dim=3, output_dim=config.D_MODEL // 2, dropout=config.DROPOUT
         )
 
         self.endpoint_encoder = nn.Sequential(
@@ -209,11 +205,11 @@ class CurveEncoder(nn.Module):
             nn.Linear(1, 32),
             nn.LayerNorm(32),
             nn.GELU(),
-            nn.Linear(32, config.D_MODEL // 4),
+            nn.Linear(32, config.D_MODEL // 8),
         )
 
         self.label_embedding = nn.Embedding(
-            config.CURVE_NUM_CLASSES, config.D_MODEL // 4
+            config.CURVE_NUM_CLASSES, config.D_MODEL // 8
         )
 
         self.fusion = nn.Linear(config.D_MODEL, config.D_MODEL)
@@ -258,7 +254,7 @@ class CurveEncoder(nn.Module):
 
         if self.config.USE_TRANSFORMER:
             centroids = curve_points.mean(dim=2)
-            pos_enc = self.pos_encoder(centroids, voxel_dim=self.config.VOXEL_DIM)
+            pos_enc = self.pos_encoder(centroids, voxel_dim=voxel_dim)
             tokens = tokens + pos_enc
 
             attn_mask = ~mask if mask is not None else None
@@ -284,7 +280,7 @@ class CurveDecoder(nn.Module):
             config.CURVE_LATENT_DIM, config.CURVE_LATENT_DIM, 3, 3
         )
 
-        self.curve_pe = self._init_curve_pe(config.CURVE_NUM_POINTS, config.HN_PE_DIM)
+        self.curve_pe = self._init_curve_pe(points_per_curve, config.HN_PE_DIM)
 
         self.curve_shape_embed = MLP_hn(
             input_dim=config.HN_PE_DIM,
@@ -353,18 +349,18 @@ class PatchEncoder(nn.Module):
         self.config = config
 
         self.geom_encoder = PointNetEncoder(
-            input_dim=6, output_dim=config.D_MODEL // 2, dropout=config.DROPOUT
+            input_dim=6, output_dim=config.D_MODEL // 3 * 2, dropout=config.DROPOUT
         )
 
         self.topo_encoder = nn.Sequential(
             nn.Linear(2, 64),
             nn.LayerNorm(64),
             nn.GELU(),
-            nn.Linear(64, config.D_MODEL // 4),
+            nn.Linear(64, config.D_MODEL // 6),
         )
 
         self.label_embedding = nn.Embedding(
-            config.PATCH_NUM_CLASSES, config.D_MODEL // 4
+            config.PATCH_NUM_CLASSES, config.D_MODEL // 6
         )
 
         self.fusion = nn.Linear(config.D_MODEL, config.D_MODEL)
@@ -409,7 +405,7 @@ class PatchEncoder(nn.Module):
 
         if self.config.USE_TRANSFORMER:
             centroids = patch_points.mean(dim=2)
-            pos_enc = self.pos_encoder(centroids, voxel_dim=self.config.VOXEL_DIM)
+            pos_enc = self.pos_encoder(centroids, voxel_dim=voxel_dim)
             tokens = tokens + pos_enc
 
             attn_mask = ~mask if mask is not None else None
@@ -720,7 +716,7 @@ def compute_curve_vae_loss(
 
 
 def process_batch_data(data_item, config, device):
-    """Process batch data from dataloader - optimized with non_blocking transfers"""
+    """Process batch data from dataloader - 优化版本"""
     corner_points = data_item[0]
     corner_batch_idx = data_item[1]
     batch_sample_id = data_item[2]
@@ -736,45 +732,40 @@ def process_batch_data(data_item, config, device):
         max_n_curves = max([c["curve_points"].shape[0] for c in target_curves_list])
         max_n_curves = min(max_n_curves, config.MAX_CURVES)
 
-        curve_points_batch = torch.zeros(batch_size, max_n_curves, 34, 3, device=device)
-        endpoints_batch = torch.zeros(batch_size, max_n_curves, 2, 3, device=device)
-        is_closed_batch = torch.zeros(
-            batch_size, max_n_curves, dtype=torch.bool, device=device
-        )
-        labels_batch = torch.zeros(
-            batch_size, max_n_curves, dtype=torch.long, device=device
-        )
-        mask_batch = torch.zeros(
-            batch_size, max_n_curves, dtype=torch.bool, device=device
-        )
-        weighting_batch = torch.ones(
-            batch_size, max_n_curves, dtype=torch.float, device=device
-        )
+        # 直接在GPU上创建张量
+        curve_points_batch = torch.zeros(batch_size, max_n_curves, 34, 3, device=device, dtype=torch.float32)
+        endpoints_batch = torch.zeros(batch_size, max_n_curves, 2, 3, device=device, dtype=torch.float32)
+        is_closed_batch = torch.zeros(batch_size, max_n_curves, dtype=torch.bool, device=device)
+        labels_batch = torch.zeros(batch_size, max_n_curves, dtype=torch.long, device=device)
+        mask_batch = torch.zeros(batch_size, max_n_curves, dtype=torch.bool, device=device)
+        weighting_batch = torch.ones(batch_size, max_n_curves, dtype=torch.float32, device=device)
 
         for i, curve_dict in enumerate(target_curves_list):
             n_curves = min(curve_dict["curve_points"].shape[0], max_n_curves)
-
-            curve_points_batch[i, :n_curves] = curve_dict["curve_points"][:n_curves].to(device, non_blocking=True)
-            is_closed_batch[i, :n_curves] = curve_dict["is_closed"][:n_curves].to(device, non_blocking=True)
-            labels_batch[i, :n_curves] = curve_dict["labels"][:n_curves].to(device, non_blocking=True)
-            mask_batch[i, :n_curves] = True
-
-            endpoint_indices = curve_dict["endpoints"][:n_curves].long()
-            curve_points = curve_dict["curve_points"][:n_curves]
-            is_closed = curve_dict["is_closed"][:n_curves]
             
-            for j in range(n_curves):
-                if not is_closed[j]:
-                    idx0, idx1 = endpoint_indices[j]
-                    idx0 = idx0.clamp(min=0, max=33)
-                    idx1 = idx1.clamp(min=0, max=33)
-                    endpoints_batch[i, j, 0] = curve_points[j, idx0]
-                    endpoints_batch[i, j, 1] = curve_points[j, idx1]
+            if n_curves > 0:
+                curve_points_batch[i, :n_curves].copy_(curve_dict["curve_points"][:n_curves], non_blocking=True)
+                is_closed_batch[i, :n_curves].copy_(curve_dict["is_closed"][:n_curves], non_blocking=True)
+                labels_batch[i, :n_curves].copy_(curve_dict["labels"][:n_curves], non_blocking=True)
+                mask_batch[i, :n_curves] = True
 
-            if "curve_length_weighting" in curve_dict:
-                weighting_batch[i, :n_curves] = curve_dict["curve_length_weighting"][
-                    :n_curves
-                ].to(device, non_blocking=True)
+                endpoint_indices = curve_dict["endpoints"][:n_curves].long()
+                curve_points = curve_dict["curve_points"][:n_curves]
+                is_closed = curve_dict["is_closed"][:n_curves]
+                
+                open_mask = ~is_closed
+                if open_mask.any():
+                    open_indices = torch.where(open_mask)[0]
+                    for j in open_indices:
+                        j_val = j.item()
+                        idx0, idx1 = endpoint_indices[j_val]
+                        idx0 = max(0, min(33, idx0.item()))
+                        idx1 = max(0, min(33, idx1.item()))
+                        endpoints_batch[i, j_val, 0].copy_(curve_points[j_val, idx0], non_blocking=True)
+                        endpoints_batch[i, j_val, 1].copy_(curve_points[j_val, idx1], non_blocking=True)
+
+                if "curve_length_weighting" in curve_dict:
+                    weighting_batch[i, :n_curves].copy_(curve_dict["curve_length_weighting"][:n_curves], non_blocking=True)
 
         processed_curves = {
             "curve_points": curve_points_batch,
@@ -791,44 +782,29 @@ def process_batch_data(data_item, config, device):
         max_n_patches = max([len(p["patch_points"]) for p in target_patches_list])
         max_n_patches = min(max_n_patches, config.MAX_PATCHES)
 
-        patch_points_batch = torch.zeros(
-            batch_size, max_n_patches, 400, 3, device=device
-        )
-        patch_normals_batch = torch.zeros(
-            batch_size, max_n_patches, 400, 3, device=device
-        )
-        u_closed_batch = torch.zeros(
-            batch_size, max_n_patches, dtype=torch.bool, device=device
-        )
-        v_closed_batch = torch.zeros(
-            batch_size, max_n_patches, dtype=torch.bool, device=device
-        )
-        labels_batch = torch.zeros(
-            batch_size, max_n_patches, dtype=torch.long, device=device
-        )
-        mask_batch = torch.zeros(
-            batch_size, max_n_patches, dtype=torch.bool, device=device
-        )
-        weighting_batch = torch.ones(
-            batch_size, max_n_patches, dtype=torch.float, device=device
-        )
+        patch_points_batch = torch.zeros(batch_size, max_n_patches, 400, 3, device=device, dtype=torch.float32)
+        patch_normals_batch = torch.zeros(batch_size, max_n_patches, 400, 3, device=device, dtype=torch.float32)
+        u_closed_batch = torch.zeros(batch_size, max_n_patches, dtype=torch.bool, device=device)
+        v_closed_batch = torch.zeros(batch_size, max_n_patches, dtype=torch.bool, device=device)
+        labels_batch = torch.zeros(batch_size, max_n_patches, dtype=torch.long, device=device)
+        mask_batch = torch.zeros(batch_size, max_n_patches, dtype=torch.bool, device=device)
+        weighting_batch = torch.ones(batch_size, max_n_patches, dtype=torch.float32, device=device)
 
         for i, patch_dict in enumerate(target_patches_list):
             n_patches = min(len(patch_dict["patch_points"]), max_n_patches)
 
-            for j in range(n_patches):
-                patch_points_batch[i, j] = patch_dict["patch_points"][j].to(device, non_blocking=True)
-                patch_normals_batch[i, j] = patch_dict["patch_normals"][j].to(device, non_blocking=True)
+            if n_patches > 0:
+                for j in range(n_patches):
+                    patch_points_batch[i, j].copy_(patch_dict["patch_points"][j], non_blocking=True)
+                    patch_normals_batch[i, j].copy_(patch_dict["patch_normals"][j], non_blocking=True)
 
-            u_closed_batch[i, :n_patches] = patch_dict["u_closed"][:n_patches].to(device, non_blocking=True)
-            v_closed_batch[i, :n_patches] = patch_dict["v_closed"][:n_patches].to(device, non_blocking=True)
-            labels_batch[i, :n_patches] = patch_dict["labels"][:n_patches].to(device, non_blocking=True)
-            mask_batch[i, :n_patches] = True
+                u_closed_batch[i, :n_patches].copy_(patch_dict["u_closed"][:n_patches], non_blocking=True)
+                v_closed_batch[i, :n_patches].copy_(patch_dict["v_closed"][:n_patches], non_blocking=True)
+                labels_batch[i, :n_patches].copy_(patch_dict["labels"][:n_patches], non_blocking=True)
+                mask_batch[i, :n_patches] = True
 
-            if "patch_area_weighting" in patch_dict:
-                weighting_batch[i, :n_patches] = patch_dict["patch_area_weighting"][
-                    :n_patches
-                ].to(device, non_blocking=True)
+                if "patch_area_weighting" in patch_dict:
+                    weighting_batch[i, :n_patches].copy_(patch_dict["patch_area_weighting"][:n_patches], non_blocking=True)
 
         processed_patches = {
             "patch_points": patch_points_batch,
@@ -842,6 +818,34 @@ def process_batch_data(data_item, config, device):
 
     return processed_curves, processed_patches
 
+class LossAccumulator:
+    """优化版本 - 减少CPU-GPU同步"""
+    def __init__(self):
+        self.losses = {}
+        self.count = 0
+        
+    def add(self, loss_dict):
+        for key, val in loss_dict.items():
+            if key not in self.losses:
+                self.losses[key] = []
+            # 保持在GPU上
+            self.losses[key].append(val.detach())
+        self.count += 1
+    
+    def get_averages(self):
+        """批量转CPU计算平均值"""
+        if self.count == 0:
+            return {}
+        averages = {}
+        for key, vals in self.losses.items():
+            if vals:
+                stacked = torch.stack(vals)
+                averages[key] = stacked.mean().item()
+        return averages
+    
+    def reset(self):
+        self.losses = {}
+        self.count = 0
 
 def compute_patch_metrics(pred, target, mask):
     """Compute patch evaluation metrics"""
@@ -937,30 +941,6 @@ def compute_curve_metrics(pred, target, mask):
 
     return metrics
 
-
-class LossAccumulator:
-    """Accumulate losses without frequent CPU-GPU sync"""
-    def __init__(self):
-        self.losses = {}
-        
-    def add(self, loss_dict):
-        for key, val in loss_dict.items():
-            if key not in self.losses:
-                self.losses[key] = []
-            # Keep as tensor, don't call .item() yet
-            self.losses[key].append(val.detach())
-    
-    def get_averages(self):
-        """Convert to CPU and compute averages only when needed"""
-        averages = {}
-        for key, vals in self.losses.items():
-            if vals:
-                stacked = torch.stack(vals)
-                averages[key] = stacked.mean().item()
-        return averages
-    
-    def reset(self):
-        self.losses = {}
 
 def train_pipeline(rank, num_gpus, args, config):
     dist.init_process_group(
@@ -1555,7 +1535,6 @@ def eval_pipeline(args, config):
     """Complete evaluation pipeline"""
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    voxel_dim = config.VOXEL_DIM if hasattr(config, "VOXEL_DIM") else 64
     points_per_patch_dim = (
         config.POINTS_PER_PATCH_DIM if hasattr(config, "POINTS_PER_PATCH_DIM") else 32
     )
