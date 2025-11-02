@@ -21,7 +21,6 @@ from Minkowski_backbone import (
     voxel_dim,
     points_per_patch_dim,
     num_of_gpus,
-    prepare_experiment_folders,
     MLP,
     MLP_hn,
 )
@@ -30,15 +29,15 @@ from data_loader_abc import *
 
 class Config:
     # Model Architecture
-    D_MODEL = 256
+    D_MODEL = 384
     NHEAD = 8
     NUM_LAYERS = 6
     DIM_FEEDFORWARD = 1024
     DROPOUT = 0.1
 
     # Latent Space
-    CURVE_LATENT_DIM = 128
-    PATCH_LATENT_DIM = 128
+    CURVE_LATENT_DIM = 256
+    PATCH_LATENT_DIM = 256
 
     # Data
     CURVE_NUM_POINTS = 34
@@ -66,18 +65,18 @@ class Config:
     KL_WARMUP_EPOCHS = 10
 
     # Training Optimization
-    LEARNING_RATE = 1e-4
+    LEARNING_RATE = 5e-4
     WEIGHT_DECAY = 1e-5
     GRAD_CLIP_NORM = 1.0
-    EVAL_INTERVAL = 5
+    EVAL_INTERVAL = 10
     SAVE_INTERVAL = 10
     
     # Performance Optimization
     USE_AMP = False  # Mixed precision training
-    GRADIENT_ACCUMULATION_STEPS = 1  # Accumulate gradients
+    GRADIENT_ACCUMULATION_STEPS = 4  # Accumulate gradients
     DATALOADER_PREFETCH_FACTOR = 2  # Prefetch batches
     DATALOADER_PERSISTENT_WORKERS = True  # Keep workers alive
-    LOG_INTERVAL = 50  # Log every N batches to reduce sync
+    LOG_INTERVAL = 100  # Log every N batches to reduce sync
 
     # Loss weights
     RECON_WEIGHT = 1.0
@@ -114,6 +113,7 @@ def setup_logger(log_dir, rank=0):
 class PositionEmbeddingSine3D(nn.Module):
     def __init__(self, num_pos_feats=64, temperature=10000, normalize=True, scale=None):
         super().__init__()
+        assert num_pos_feats % 2 == 0
         self.num_pos_feats = num_pos_feats
         self.temperature = temperature
         self.normalize = normalize
@@ -121,32 +121,38 @@ class PositionEmbeddingSine3D(nn.Module):
 
     def forward(self, xyz_coords, voxel_dim=64):
         B, N, _ = xyz_coords.shape
+        device = xyz_coords.device
 
         if self.normalize:
             coords = self.scale * xyz_coords / (voxel_dim - 1)
         else:
             coords = xyz_coords
 
-        dim_t = torch.arange(
-            self.num_pos_feats, dtype=torch.float32, device=xyz_coords.device
-        )
+        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=device)
         dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)
 
+        # coords: [B, N, 3], dim_t: [num_pos_feats]
+        # pos: [B, N, 3, num_pos_feats]
         pos = coords[:, :, :, None] / dim_t
-        pos_x, pos_y, pos_z = pos[:, :, 0], pos[:, :, 1], pos[:, :, 2]
 
-        pos_x = torch.stack(
-            (pos_x[:, :, 0::2].sin(), pos_x[:, :, 1::2].cos()), dim=3
-        ).flatten(2)
-        pos_y = torch.stack(
-            (pos_y[:, :, 0::2].sin(), pos_y[:, :, 1::2].cos()), dim=3
-        ).flatten(2)
-        pos_z = torch.stack(
-            (pos_z[:, :, 0::2].sin(), pos_z[:, :, 1::2].cos()), dim=3
-        ).flatten(2)
+        pos_x = pos[:, :, 0, :]  # [B, N, num_pos_feats]
+        pos_y = pos[:, :, 1, :]  # [B, N, num_pos_feats]
+        pos_z = pos[:, :, 2, :]  # [B, N, num_pos_feats]
 
-        return torch.cat((pos_x, pos_y, pos_z), dim=2)
+        pos_x_sin = pos_x[:, :, 0::2].sin()  # [B, N, num_pos_feats//2]
+        pos_x_cos = pos_x[:, :, 1::2].cos()  # [B, N, num_pos_feats//2]
+        
+        pos_y_sin = pos_y[:, :, 0::2].sin()
+        pos_y_cos = pos_y[:, :, 1::2].cos()
+        
+        pos_z_sin = pos_z[:, :, 0::2].sin()
+        pos_z_cos = pos_z[:, :, 1::2].cos()
 
+        pos_x_encoded = torch.stack([pos_x_sin, pos_x_cos], dim=3).flatten(2)  # [B, N, num_pos_feats]
+        pos_y_encoded = torch.stack([pos_y_sin, pos_y_cos], dim=3).flatten(2)  # [B, N, num_pos_feats]
+        pos_z_encoded = torch.stack([pos_z_sin, pos_z_cos], dim=3).flatten(2)  # [B, N, num_pos_feats]
+
+        return torch.cat([pos_x_encoded, pos_y_encoded, pos_z_encoded], dim=2)  # [B, N, num_pos_feats*3]
 
 class PointNetEncoder(nn.Module):
     """PointNet-based feature extractor"""
@@ -956,9 +962,7 @@ class LossAccumulator:
     def reset(self):
         self.losses = {}
 
-
 def train_pipeline(rank, num_gpus, args, config):
-    """Complete training pipeline with performance optimization"""
     dist.init_process_group(
         backend="nccl",
         init_method="tcp://127.0.0.1:23257",
@@ -1322,17 +1326,22 @@ def train_pipeline(rank, num_gpus, args, config):
         avg_curve_losses = curve_loss_acc.get_averages()
 
         if rank == 0:
-            # Log to wandb
             log_dict = {
                 "epoch": epoch + 1,
                 "kl_weight": current_kl_weight,
             }
             
-            for key, val in avg_patch_losses.items():
-                log_dict[f"train/patch_{key}"] = val
+            if avg_patch_losses:
+                log_dict["train/patch_total"] = avg_patch_losses.get('total', 0)
+                log_dict["train/patch_kl"] = avg_patch_losses.get('kl', 0)
+                log_dict["train/patch_recon_points"] = avg_patch_losses.get('recon_points', 0)
+                log_dict["train/patch_topology"] = (avg_patch_losses.get('u_closed', 0) + avg_patch_losses.get('v_closed', 0)) / 2
             
-            for key, val in avg_curve_losses.items():
-                log_dict[f"train/curve_{key}"] = val
+            if avg_curve_losses:
+                log_dict["train/curve_total"] = avg_curve_losses.get('total', 0)
+                log_dict["train/curve_kl"] = avg_curve_losses.get('kl', 0)
+                log_dict["train/curve_recon_points"] = avg_curve_losses.get('recon_points', 0)
+                log_dict["train/curve_topology"] = avg_curve_losses.get('closed', 0)
             
             wandb.log(log_dict)
             
@@ -1357,13 +1366,11 @@ def train_pipeline(rank, num_gpus, args, config):
                 val_log_dict = {"epoch": epoch + 1}
                 
                 if "patch" in val_metrics and val_metrics["patch"]:
-                    for key, val in val_metrics["patch"].items():
-                        val_log_dict[f"val/patch_{key}"] = val
+                    val_log_dict["val/patch_recon_error"] = val_metrics['patch']['recon_error']
                     logger.info(f"Val Patch Recon Error: {val_metrics['patch']['recon_error']:.6f}")
                 
                 if "curve" in val_metrics and val_metrics["curve"]:
-                    for key, val in val_metrics["curve"].items():
-                        val_log_dict[f"val/curve_{key}"] = val
+                    val_log_dict["val/curve_recon_error"] = val_metrics['curve']['recon_error']
                     logger.info(f"Val Curve Recon Error: {val_metrics['curve']['recon_error']:.6f}")
                 
                 wandb.log(val_log_dict)
@@ -1415,8 +1422,29 @@ def train_pipeline(rank, num_gpus, args, config):
             )
             logger.info(f"Saved checkpoint for epoch {epoch+1}")
 
+    # 训练结束后的中文损失解释
     if rank == 0:
+        print("\n" + "="*80)
+        print("训练完成！各项损失含义解释：")
+        print("="*80)
+        print("【Patch 面片损失】:")
+        print("  • total: 总损失 - 所有损失项的加权和，用于反向传播优化")
+        print("  • kl: KL散度损失 - 确保编码后的潜在向量符合标准正态分布，实现正则化")
+        print("  • recon_points: 点重建损失 - 衡量重建的3D点坐标与真实坐标的差异")
+        print("  • topology: 拓扑损失 - 预测面片在U/V方向是否闭合的分类准确性")
+        print()
+        print("【Curve 曲线损失】:")
+        print("  • total: 总损失 - 所有损失项的加权和，用于反向传播优化")
+        print("  • kl: KL散度损失 - 确保编码后的潜在向量符合标准正态分布，实现正则化")
+        print("  • recon_points: 点重建损失 - 衡量重建的3D曲线点坐标与真实坐标的差异")
+        print("  • topology: 拓扑损失 - 预测曲线是否为闭合曲线的分类准确性")
+        print()
+        print("【验证损失】:")
+        print("  • recon_error: 重建误差 - 在验证集上测量的几何重建精度，越小越好")
+        print("="*80)
+        
         wandb.finish()
+
 
 def val_pipeline(
     patch_encoder,
@@ -1424,14 +1452,13 @@ def val_pipeline(
     curve_encoder,
     curve_decoder,
     val_dataloader,
-    val_sampler,  # 添加sampler参数
-    epoch,  # 添加epoch参数
+    val_sampler,  
+    epoch,  
     device,
     config,
     rank=0,
 ):
     """Validation pipeline with sampler support"""
-    # 设置validation sampler的epoch
     if val_sampler is not None:
         val_sampler.set_epoch(epoch)
     
@@ -1522,6 +1549,7 @@ def val_pipeline(
     curve_decoder.train()
 
     return val_metrics
+
 
 def eval_pipeline(args, config):
     """Complete evaluation pipeline"""
@@ -1672,16 +1700,16 @@ def eval_pipeline(args, config):
             )
 
     print("\n" + "=" * 60)
-    print("TEST RESULTS")
+    print("测试结果")
     print("=" * 60)
 
     if avg_patch_metrics:
-        print("\nPATCH METRICS:")
+        print("\n面片指标:")
         for key, val in avg_patch_metrics.items():
             print(f"  {key}: {val:.6f}")
 
     if avg_curve_metrics:
-        print("\nCURVE METRICS:")
+        print("\n曲线指标:")
         for key, val in avg_curve_metrics.items():
             print(f"  {key}: {val:.6f}")
 
@@ -1691,27 +1719,25 @@ def eval_pipeline(args, config):
 
     if hasattr(args, "experiment_name") and args.experiment_name:
         results_path = os.path.join(args.checkpoint_dir, "test_results.txt")
-        with open(results_path, "w") as f:
+        with open(results_path, "w", encoding='utf-8') as f:
             f.write("=" * 60 + "\n")
-            f.write("TEST RESULTS\n")
+            f.write("测试结果\n")
             f.write("=" * 60 + "\n\n")
 
             if avg_patch_metrics:
-                f.write("PATCH METRICS:\n")
+                f.write("面片指标:\n")
                 for key, value in avg_patch_metrics.items():
                     f.write(f"  {key}: {value:.6f}\n")
                 f.write("\n")
 
             if avg_curve_metrics:
-                f.write("CURVE METRICS:\n")
+                f.write("曲线指标:\n")
                 for key, value in avg_curve_metrics.items():
                     f.write(f"  {key}: {value:.6f}\n")
 
-        print(f"\nResults saved to: {results_path}")
+        print(f"\n结果已保存到: {results_path}")
 
     return test_metrics
-
-
 if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(True)
 

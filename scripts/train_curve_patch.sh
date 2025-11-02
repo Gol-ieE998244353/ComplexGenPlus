@@ -1,0 +1,1 @@
+python curve_patch_trainer.py --experiment_name cptrain  --no_pe --hn_scale --input_normal_signals --patch_grid --ourresnet --parsenet --patch_close --patch_emd --patch_uv --max_training_iterations 10000 --quicktest    
