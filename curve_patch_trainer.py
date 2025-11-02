@@ -60,7 +60,6 @@ class Config:
     KL_WARMUP_EPOCHS = 10
 
     # Training
-    NUM_EPOCHS = 100
     LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-5
     GRAD_CLIP_NORM = 1.0
@@ -80,7 +79,6 @@ class Config:
 
 
 class PositionEmbeddingSine3D(nn.Module):
-    """3D sinusoidal positional encoding (仅在USE_TRANSFORMER=True时使用)"""
 
     def __init__(self, num_pos_feats=64, temperature=10000, normalize=True, scale=None):
         super().__init__()
@@ -158,7 +156,6 @@ class PointNetEncoder(nn.Module):
         features = self.global_mlp(global_feat).view(B, N, -1)
 
         return features
-
 
 class CurveEncoder(nn.Module):
     def __init__(self, config=Config):
@@ -353,6 +350,11 @@ class CurveDecoder(nn.Module):
         label_logits = self.label_head(z)
         validity_logits = self.validity_head(z).squeeze(-1)
 
+        print("Points shape:", points.shape)
+        print("Endpoints shape:", endpoints.shape)
+        print("Closed logits shape:", closed_logits.shape)
+        print("Label logits shape:", label_logits.shape)
+        print("Validity logits shape:", validity_logits.shape)
         return {
             "points": points,
             "endpoints": endpoints,
@@ -445,9 +447,7 @@ class PatchEncoder(nn.Module):
 
         return mean, logvar
 
-
 class PatchDecoder(nn.Module):
-    """Patch Decoder - 使用HyperNetwork"""
 
     def __init__(self, config=Config):
         super().__init__()
@@ -516,8 +516,8 @@ class PatchDecoder(nn.Module):
         patch_pe = torch.stack(patch_pe, dim=0)
         patch_pe = patch_pe.unsqueeze(0).unsqueeze(0).repeat(B, N, 1, 1)
 
-        # 3. HyperNetwork生成shape + normals
         output = self.patch_shape_embed(patch_pe.unsqueeze(0), z.unsqueeze(0))
+
         shape_offset = output[..., :3]
         normals = output[..., 3:]
 
@@ -542,15 +542,12 @@ class PatchDecoder(nn.Module):
 
 
 class KLScheduler:
-    """简单的KL warmup调度器"""
-
     def __init__(self, start_weight=0.0, end_weight=0.1, warmup_epochs=10):
         self.start = start_weight
         self.end = end_weight
         self.warmup = warmup_epochs
 
     def get_weight(self, epoch):
-        """线性warmup"""
         if epoch >= self.warmup:
             return self.end
         return self.start + (self.end - self.start) * (epoch / self.warmup)
@@ -1078,12 +1075,6 @@ def compute_curve_metrics(pred, target, mask):
 
     return metrics
 
-
-# ============================================================================
-# Updated Training Pipeline
-# ============================================================================
-
-
 def train_pipeline(rank, num_gpus, args, config):
     """
     Complete training pipeline with data loading and distributed setup
@@ -1252,13 +1243,13 @@ def train_pipeline(rank, num_gpus, args, config):
     # ===== Training loop =====
     best_val_loss = float("inf")
 
-    for epoch in range(start_epoch, config.NUM_EPOCHS):
+    for epoch in range(start_epoch, args.max_training_iterations):
         # Get current KL weight
         current_kl_weight = kl_scheduler.get_weight(epoch)
 
         if rank == 0:
             print(
-                f"\nEpoch {epoch+1}/{config.NUM_EPOCHS} - KL Weight: {current_kl_weight:.4f}"
+                f"\nEpoch {epoch+1}/{args.max_training_iterations} - KL Weight: {current_kl_weight:.4f}"
             )
 
         # Set models to training mode
