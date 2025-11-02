@@ -6,6 +6,16 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
 from typing import Tuple, Optional, Dict
+import math
+from tqdm import tqdm
+import torch.multiprocessing as mp
+import os
+import torch.distributed as dist
+import logging
+from datetime import datetime
+import wandb
+from torch.cuda.amp import autocast, GradScaler
+
 from Minkowski_backbone import (
     get_args_parser,
     voxel_dim,
@@ -16,10 +26,6 @@ from Minkowski_backbone import (
     MLP_hn,
 )
 from data_loader_abc import *
-from tqdm import tqdm
-import torch.multiprocessing as mp
-import os
-import torch.distributed as dist
 
 
 class Config:
@@ -36,16 +42,16 @@ class Config:
 
     # Data
     CURVE_NUM_POINTS = 34
-    PATCH_NUM_POINTS = 400  # 20x20
+    PATCH_NUM_POINTS = 400
     POINTS_PER_PATCH_DIM = 20
     MAX_CURVES = 100
     MAX_PATCHES = 50
 
-    # HyperNetwork (for decoder)
+    # HyperNetwork
     HN_PE_DIM = 32
     HN_MLP_DIM = 128
 
-    # Position Encoding (只在使用transformer时需要)
+    # Position Encoding
     VOXEL_DIM = 128
     PE_TEMPERATURE = 10000
     PE_SCALE = 2 * math.pi
@@ -59,12 +65,19 @@ class Config:
     KL_WEIGHT_END = 0.1
     KL_WARMUP_EPOCHS = 10
 
-    # Training
+    # Training Optimization
     LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-5
     GRAD_CLIP_NORM = 1.0
     EVAL_INTERVAL = 5
     SAVE_INTERVAL = 10
+    
+    # Performance Optimization
+    USE_AMP = False  # Mixed precision training
+    GRADIENT_ACCUMULATION_STEPS = 1  # Accumulate gradients
+    DATALOADER_PREFETCH_FACTOR = 2  # Prefetch batches
+    DATALOADER_PERSISTENT_WORKERS = True  # Keep workers alive
+    LOG_INTERVAL = 50  # Log every N batches to reduce sync
 
     # Loss weights
     RECON_WEIGHT = 1.0
@@ -73,13 +86,32 @@ class Config:
     LABEL_WEIGHT = 0.5
     VALIDITY_WEIGHT = 0.1
 
-    # === 实验性选项 ===
-    USE_TRANSFORMER = False  # 是否使用transformer让curves/patches互相attention
-    # 如果为False，每个curve/patch独立编码（推荐）
+    # Experimental options
+    USE_TRANSFORMER = False
+    USE_FOCAL_LOSS = False
+    FOCAL_ALPHA = 0.25
+    FOCAL_GAMMA = 2.0
+
+
+def setup_logger(log_dir, rank=0):
+    """Setup file logger"""
+    if rank != 0:
+        return None
+    
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f'training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+        ]
+    )
+    return logging.getLogger(__name__)
 
 
 class PositionEmbeddingSine3D(nn.Module):
-
     def __init__(self, num_pos_feats=64, temperature=10000, normalize=True, scale=None):
         super().__init__()
         self.num_pos_feats = num_pos_feats
@@ -118,7 +150,6 @@ class PositionEmbeddingSine3D(nn.Module):
 
 class PointNetEncoder(nn.Module):
     """PointNet-based feature extractor"""
-
     def __init__(self, input_dim=3, output_dim=128, dropout=0.1):
         super().__init__()
 
@@ -142,12 +173,6 @@ class PointNetEncoder(nn.Module):
         )
 
     def forward(self, points):
-        """
-        Args:
-            points: [B, N, P, C]
-        Returns:
-            features: [B, N, output_dim]
-        """
         B, N, P, C = points.shape
         x = points.view(B * N, P, C)
 
@@ -157,17 +182,16 @@ class PointNetEncoder(nn.Module):
 
         return features
 
+
 class CurveEncoder(nn.Module):
     def __init__(self, config=Config):
         super().__init__()
         self.config = config
 
-        # Geometry feature extraction (PointNet)
         self.geom_encoder = PointNetEncoder(
             input_dim=3, output_dim=config.D_MODEL // 4, dropout=config.DROPOUT
         )
 
-        # Endpoint encoding
         self.endpoint_encoder = nn.Sequential(
             nn.Linear(6, 64),
             nn.LayerNorm(64),
@@ -175,7 +199,6 @@ class CurveEncoder(nn.Module):
             nn.Linear(64, config.D_MODEL // 4),
         )
 
-        # Closed flag encoding
         self.closed_encoder = nn.Sequential(
             nn.Linear(1, 32),
             nn.LayerNorm(32),
@@ -183,15 +206,12 @@ class CurveEncoder(nn.Module):
             nn.Linear(32, config.D_MODEL // 4),
         )
 
-        # Type embedding
         self.label_embedding = nn.Embedding(
             config.CURVE_NUM_CLASSES, config.D_MODEL // 4
         )
 
-        # Feature fusion
         self.fusion = nn.Linear(config.D_MODEL, config.D_MODEL)
 
-        # Optional Transformer
         if config.USE_TRANSFORMER:
             self.pos_encoder = PositionEmbeddingSine3D(
                 num_pos_feats=config.D_MODEL // 3,
@@ -213,45 +233,25 @@ class CurveEncoder(nn.Module):
                 encoder_layer, num_layers=config.NUM_LAYERS
             )
 
-        # Project to latent space
         self.to_mean = nn.Linear(config.D_MODEL, config.CURVE_LATENT_DIM)
         self.to_logvar = nn.Linear(config.D_MODEL, config.CURVE_LATENT_DIM)
 
     def forward(self, curve_points, endpoints, is_closed, labels, mask):
-        """
-        Args:
-            curve_points: [B, N, 34, 3]
-            endpoints: [B, N, 2, 3] - endpoint coordinates (zeros for closed curves)
-            is_closed: [B, N] - bool (True=closed curve)
-            labels: [B, N]
-            mask: [B, N] - bool (True=valid)
-
-        Returns:
-            mean, logvar: [B, N, latent_dim]
-        """
         B, N = curve_points.shape[:2]
         device = curve_points.device
 
-        # Flatten endpoints for encoder: [B, N, 6]
         endpoints_flat = endpoints.reshape(B, N, 6)
 
-        # Encode features
-        geom_feat = self.geom_encoder(curve_points)  # [B, N, D/4]
-        endpoint_feat = self.endpoint_encoder(endpoints_flat)  # [B, N, D/4]
-        closed_feat = self.closed_encoder(
-            is_closed.unsqueeze(-1).float()
-        )  # [B, N, D/4]
-        label_feat = self.label_embedding(labels)  # [B, N, D/4]
+        geom_feat = self.geom_encoder(curve_points)
+        endpoint_feat = self.endpoint_encoder(endpoints_flat)
+        closed_feat = self.closed_encoder(is_closed.unsqueeze(-1).float())
+        label_feat = self.label_embedding(labels)
 
-        # Fuse features
-        all_feat = torch.cat(
-            [geom_feat, endpoint_feat, closed_feat, label_feat], dim=-1
-        )
-        tokens = self.fusion(all_feat)  # [B, N, D_MODEL]
+        all_feat = torch.cat([geom_feat, endpoint_feat, closed_feat, label_feat], dim=-1)
+        tokens = self.fusion(all_feat)
 
-        # Optional transformer
         if self.config.USE_TRANSFORMER:
-            centroids = curve_points.mean(dim=2)  # [B, N, 3]
+            centroids = curve_points.mean(dim=2)
             pos_enc = self.pos_encoder(centroids, voxel_dim=self.config.VOXEL_DIM)
             tokens = tokens + pos_enc
 
@@ -262,27 +262,24 @@ class CurveEncoder(nn.Module):
             contextualized = tokens
             contextualized = contextualized * mask.unsqueeze(-1).float()
 
-        # Project to latent space
         mean = self.to_mean(contextualized)
         logvar = self.to_logvar(contextualized)
         logvar = torch.clamp(logvar, min=-10, max=10)
 
         return mean, logvar
 
+
 class CurveDecoder(nn.Module):
     def __init__(self, config=Config):
         super().__init__()
         self.config = config
 
-        # === 1. Start point predictor ===
         self.start_point_embed = MLP(
             config.CURVE_LATENT_DIM, config.CURVE_LATENT_DIM, 3, 3
         )
 
-        # === 2. Parametric encoding ===
         self.curve_pe = self._init_curve_pe(config.CURVE_NUM_POINTS, config.HN_PE_DIM)
 
-        # === 3. HyperNetwork ===
         self.curve_shape_embed = MLP_hn(
             input_dim=config.HN_PE_DIM,
             hidden_dim=config.HN_MLP_DIM,
@@ -291,7 +288,6 @@ class CurveDecoder(nn.Module):
             input_dim_fea=config.CURVE_LATENT_DIM,
         )
 
-        # === 4. Attribute predictors ===
         self.endpoints_head = MLP(
             config.CURVE_LATENT_DIM, config.CURVE_LATENT_DIM, 6, 3
         )
@@ -305,7 +301,6 @@ class CurveDecoder(nn.Module):
         self.validity_head = MLP(config.CURVE_LATENT_DIM, config.CURVE_LATENT_DIM, 1, 3)
 
     def _init_curve_pe(self, num_points, pe_dim):
-        """初始化参数化位置编码 t ∈ [0,1]"""
         device = "cuda" if torch.cuda.is_available() else "cpu"
         coord = torch.arange(num_points, dtype=torch.float32, device=device) / (
             num_points - 1
@@ -324,56 +319,37 @@ class CurveDecoder(nn.Module):
         return nn.Parameter(pe, requires_grad=False)
 
     def forward(self, z):
-        """
-        Args:
-            z: [B, N, latent_dim]
-        Returns:
-            dict with reconstructed attributes
-        """
         B, N = z.shape[:2]
 
-        # 1. Predict start point
         start_point = self.start_point_embed(z).tanh() * 0.5
-
-        # 2. Get parametric encoding
         curve_pe = self.curve_pe.unsqueeze(0).unsqueeze(0).repeat(B, N, 1, 1)
-
-        # 3. HyperNetwork生成curve shape
         shape_offset = self.curve_shape_embed(curve_pe.unsqueeze(0), z.unsqueeze(0))
-
-        # 4. Final curve points
+        shape_offset = shape_offset.squeeze(0)
         points = start_point.unsqueeze(2) + shape_offset
 
-        # 5. Predict attributes
         endpoints = self.endpoints_head(z).view(B, N, 2, 3)
         closed_logits = self.closed_head(z).squeeze(-1)
         label_logits = self.label_head(z)
         validity_logits = self.validity_head(z).squeeze(-1)
 
-        print("Points shape:", points.shape)
-        print("Endpoints shape:", endpoints.shape)
-        print("Closed logits shape:", closed_logits.shape)
-        print("Label logits shape:", label_logits.shape)
-        print("Validity logits shape:", validity_logits.shape)
         return {
-            "points": points,
-            "endpoints": endpoints,
-            "closed_logits": closed_logits,
-            "label_logits": label_logits,
-            "validity_logits": validity_logits,
+            "points": points, #[B N 34 3]
+            "endpoints": endpoints, #[B N 2 3]
+            "closed_logits": closed_logits, #[B N]
+            "label_logits": label_logits,  #[B N]
+            "validity_logits": validity_logits, #[B N]
         }
+
 
 class PatchEncoder(nn.Module):
     def __init__(self, config=Config):
         super().__init__()
         self.config = config
 
-        # 几何编码（points + normals）
         self.geom_encoder = PointNetEncoder(
             input_dim=6, output_dim=config.D_MODEL // 2, dropout=config.DROPOUT
         )
 
-        # 拓扑编码
         self.topo_encoder = nn.Sequential(
             nn.Linear(2, 64),
             nn.LayerNorm(64),
@@ -381,15 +357,12 @@ class PatchEncoder(nn.Module):
             nn.Linear(64, config.D_MODEL // 4),
         )
 
-        # 类型embedding
         self.label_embedding = nn.Embedding(
             config.PATCH_NUM_CLASSES, config.D_MODEL // 4
         )
 
-        # 特征融合
         self.fusion = nn.Linear(config.D_MODEL, config.D_MODEL)
 
-        # [可选] Transformer
         if config.USE_TRANSFORMER:
             self.pos_encoder = PositionEmbeddingSine3D(
                 num_pos_feats=config.D_MODEL // 3,
@@ -411,7 +384,6 @@ class PatchEncoder(nn.Module):
                 encoder_layer, num_layers=config.NUM_LAYERS
             )
 
-        # 投影到latent
         self.to_mean = nn.Linear(config.D_MODEL, config.PATCH_LATENT_DIM)
         self.to_logvar = nn.Linear(config.D_MODEL, config.PATCH_LATENT_DIM)
 
@@ -447,33 +419,29 @@ class PatchEncoder(nn.Module):
 
         return mean, logvar
 
-class PatchDecoder(nn.Module):
 
+class PatchDecoder(nn.Module):
     def __init__(self, config=Config):
         super().__init__()
         self.config = config
         self.patch_dim = int(math.sqrt(config.PATCH_NUM_POINTS))
 
-        # Center point predictor
         self.startpoint_embed = MLP(
             config.PATCH_LATENT_DIM, config.PATCH_LATENT_DIM, 3, 3
         )
 
-        # Parametric encoding
         self.patch_pe_u, self.patch_pe_v = self._init_patch_pe(
             self.patch_dim, config.HN_PE_DIM
         )
 
-        # HyperNetwork
         self.patch_shape_embed = MLP_hn(
             input_dim=config.HN_PE_DIM * 2,
             hidden_dim=config.HN_MLP_DIM,
-            output_dim=6,  # 3 for points + 3 for normals
+            output_dim=6,
             num_layers=3,
             input_dim_fea=config.PATCH_LATENT_DIM,
         )
 
-        # Attribute predictors
         self.u_closed_head = MLP(config.PATCH_LATENT_DIM, config.PATCH_LATENT_DIM, 1, 3)
         self.v_closed_head = MLP(config.PATCH_LATENT_DIM, config.PATCH_LATENT_DIM, 1, 3)
         self.label_head = MLP(
@@ -517,15 +485,14 @@ class PatchDecoder(nn.Module):
         patch_pe = patch_pe.unsqueeze(0).unsqueeze(0).repeat(B, N, 1, 1)
 
         output = self.patch_shape_embed(patch_pe.unsqueeze(0), z.unsqueeze(0))
+        output = output.squeeze(0)
 
         shape_offset = output[..., :3]
         normals = output[..., 3:]
 
-        # 4. Final points and normals
         points = startpoint.unsqueeze(2) + shape_offset
         normals = F.normalize(normals, dim=-1, eps=1e-8)
 
-        # 5. Predict attributes
         u_closed_logits = self.u_closed_head(z).squeeze(-1)
         v_closed_logits = self.v_closed_head(z).squeeze(-1)
         label_logits = self.label_head(z)
@@ -554,23 +521,14 @@ class KLScheduler:
 
 
 def focal_loss(logits, targets, alpha=0.25, gamma=2.0, reduction="mean"):
-    """Focal Loss - 解决P0问题：类别不平衡
-
-    FL(p_t) = -α(1-p_t)^γ log(p_t)
-
-    Args:
-        logits: 预测logits [B, N, C] or [B, N]
-        targets: 目标标签 [B, N]
-        alpha: 平衡因子
-        gamma: 聚焦参数
-    """
-    if logits.dim() == 2:  # Binary classification
+    """Focal Loss for class imbalance"""
+    if logits.dim() == 2:
         bce_loss = F.binary_cross_entropy_with_logits(
             logits, targets.float(), reduction="none"
         )
         pt = torch.exp(-bce_loss)
         focal_loss = alpha * (1 - pt) ** gamma * bce_loss
-    else:  # Multi-class
+    else:
         ce_loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)), targets.view(-1), reduction="none"
         )
@@ -588,28 +546,14 @@ def focal_loss(logits, targets, alpha=0.25, gamma=2.0, reduction="mean"):
 def compute_patch_vae_loss(
     pred, target, mean, logvar, mask, kl_weight, config, weighting=None
 ):
-    """
-    Compute patch VAE losses with improved loss functions and weighting support
-
-    Args:
-        pred: Predictions from decoder
-        target: Target data
-        mean, logvar: VAE latent parameters
-        mask: Valid patch mask [B, N]
-        kl_weight: Current KL annealing weight
-        config: Configuration object
-        weighting: Optional patch area weighting [B, N]
-    """
+    """Compute patch VAE losses"""
     losses = {}
 
-    # KL divergence loss
     kl = -0.5 * (1 + logvar - mean.pow(2) - logvar.exp())
     kl = (kl * mask.unsqueeze(-1).float()).sum() / mask.sum().clamp(min=1)
     losses["kl"] = kl
 
-    # Apply weighting if provided
     if weighting is not None:
-        # Normalize weighting to sum to number of valid patches
         valid_weighting = weighting * mask.float()
         valid_weighting = (
             valid_weighting / (valid_weighting.sum() + 1e-8) * mask.sum().float()
@@ -618,7 +562,6 @@ def compute_patch_vae_loss(
     else:
         weight_mask = mask.unsqueeze(-1).unsqueeze(-1).float()
 
-    # Reconstruction losses with weighting
     recon_points = F.mse_loss(pred["points"], target["points"], reduction="none")
     recon_points = (recon_points * weight_mask).sum() / mask.sum().clamp(min=1)
     losses["recon_points"] = recon_points
@@ -627,7 +570,6 @@ def compute_patch_vae_loss(
     recon_normals = (recon_normals * weight_mask).sum() / mask.sum().clamp(min=1)
     losses["recon_normals"] = recon_normals
 
-    # Topology losses with Focal Loss if enabled
     topo_weight = (
         weighting if weighting is not None else torch.ones_like(mask, dtype=torch.float)
     )
@@ -660,7 +602,6 @@ def compute_patch_vae_loss(
     losses["u_closed"] = u_closed_loss
     losses["v_closed"] = v_closed_loss
 
-    # Label loss with weighting
     label_loss = F.cross_entropy(
         pred["label_logits"].view(-1, pred["label_logits"].size(-1)),
         target["labels"].view(-1),
@@ -670,13 +611,11 @@ def compute_patch_vae_loss(
     label_loss = (label_loss * topo_weight).sum() / mask.sum().clamp(min=1)
     losses["label"] = label_loss
 
-    # Validity loss
     validity_loss = F.binary_cross_entropy_with_logits(
         pred["validity_logits"], mask.float(), reduction="mean"
     )
     losses["validity"] = validity_loss
 
-    # Total loss with configurable weights
     total_loss = (
         kl_weight * kl
         + config.RECON_WEIGHT * (recon_points + recon_normals)
@@ -688,31 +627,18 @@ def compute_patch_vae_loss(
 
     return losses
 
+
 def compute_curve_vae_loss(
     pred, target, mean, logvar, mask, kl_weight, config, weighting=None
 ):
-    """
-    Compute curve VAE losses with improved loss functions and weighting support
-
-    Args:
-        pred: Predictions from decoder
-        target: Target data
-        mean, logvar: VAE latent parameters
-        mask: Valid curve mask [B, N]
-        kl_weight: Current KL annealing weight
-        config: Configuration object
-        weighting: Optional curve length weighting [B, N]
-    """
+    """Compute curve VAE losses"""
     losses = {}
 
-    # KL divergence loss
     kl = -0.5 * (1 + logvar - mean.pow(2) - logvar.exp())
     kl = (kl * mask.unsqueeze(-1).float()).sum() / mask.sum().clamp(min=1)
     losses["kl"] = kl
 
-    # Apply weighting if provided
     if weighting is not None:
-        # Normalize weighting to sum to number of valid curves
         valid_weighting = weighting * mask.float()
         valid_weighting = (
             valid_weighting / (valid_weighting.sum() + 1e-8) * mask.sum().float()
@@ -721,18 +647,16 @@ def compute_curve_vae_loss(
     else:
         weight_mask = mask.unsqueeze(-1).unsqueeze(-1).float()
 
-    # Reconstruction losses with weighting
     recon_points = F.mse_loss(pred["points"], target["points"], reduction="none")
     recon_points = (recon_points * weight_mask).sum() / mask.sum().clamp(min=1)
     losses["recon_points"] = recon_points
 
-    # Endpoint loss: only for open curves
-    open_mask = ~target["is_closed"]  # [B, N]
-    endpoint_mask = (mask & open_mask).unsqueeze(-1).unsqueeze(-1).float()  # [B, N, 1, 1]
+    open_mask = ~target["is_closed"]
+    endpoint_mask = (mask & open_mask).unsqueeze(-1).unsqueeze(-1).float()
     
     recon_endpoints = F.mse_loss(
         pred["endpoints"], target["endpoints"], reduction="none"
-    )  # [B, N, 2, 3]
+    )
     
     if weighting is not None:
         endpoint_weighting = (weighting * mask.float() * open_mask.float()).unsqueeze(-1).unsqueeze(-1)
@@ -743,7 +667,6 @@ def compute_curve_vae_loss(
     
     losses["recon_endpoints"] = recon_endpoints
 
-    # Closed flag loss with weighting
     topo_weight = (
         weighting if weighting is not None else torch.ones_like(mask, dtype=torch.float)
     )
@@ -764,7 +687,6 @@ def compute_curve_vae_loss(
 
     losses["closed"] = closed_loss
 
-    # Label loss with weighting
     label_loss = F.cross_entropy(
         pred["label_logits"].view(-1, pred["label_logits"].size(-1)),
         target["labels"].view(-1),
@@ -774,13 +696,11 @@ def compute_curve_vae_loss(
     label_loss = (label_loss * topo_weight).sum() / mask.sum().clamp(min=1)
     losses["label"] = label_loss
 
-    # Validity loss
     validity_loss = F.binary_cross_entropy_with_logits(
         pred["validity_logits"], mask.float(), reduction="mean"
     )
     losses["validity"] = validity_loss
 
-    # Total loss
     total_loss = (
         kl_weight * kl
         + config.RECON_WEIGHT * (recon_points + recon_endpoints)
@@ -792,38 +712,24 @@ def compute_curve_vae_loss(
 
     return losses
 
+
 def process_batch_data(data_item, config, device):
-    """
-    Process batch data from dataloader into proper format for VAE training
-
-    Args:
-        data_item: Raw batch from dataloader
-        config: Configuration object
-        device: Target device
-
-    Returns:
-        processed_curves: Dict with curve data
-        processed_patches: Dict with patch data
-    """
-    # Extract data components
-    corner_points = data_item[0]  # [20, 3]
-    corner_batch_idx = data_item[1]  # [20]
-    batch_sample_id = data_item[2]  # list
-    target_curves_list = data_item[6]  # list of curve dicts
-    target_patches_list = data_item[7]  # list of patch dicts
+    """Process batch data from dataloader - optimized with non_blocking transfers"""
+    corner_points = data_item[0]
+    corner_batch_idx = data_item[1]
+    batch_sample_id = data_item[2]
+    target_curves_list = data_item[6]
+    target_patches_list = data_item[7]
 
     processed_curves = None
     processed_patches = None
 
-    # ===== Process Curves =====
+    # Process Curves
     if len(target_curves_list) > 0:
         batch_size = len(target_curves_list)
-
-        # Find max number of curves in this batch
         max_n_curves = max([c["curve_points"].shape[0] for c in target_curves_list])
-        max_n_curves = min(max_n_curves, config.MAX_CURVES)  # Cap at config limit
+        max_n_curves = min(max_n_curves, config.MAX_CURVES)
 
-        # Initialize batch tensors
         curve_points_batch = torch.zeros(batch_size, max_n_curves, 34, 3, device=device)
         endpoints_batch = torch.zeros(batch_size, max_n_curves, 2, 3, device=device)
         is_closed_batch = torch.zeros(
@@ -839,38 +745,30 @@ def process_batch_data(data_item, config, device):
             batch_size, max_n_curves, dtype=torch.float, device=device
         )
 
-        # Fill batch tensors
         for i, curve_dict in enumerate(target_curves_list):
             n_curves = min(curve_dict["curve_points"].shape[0], max_n_curves)
 
-            curve_points_batch[i, :n_curves] = curve_dict["curve_points"][:n_curves].to(
-                device
-            )
-            is_closed_batch[i, :n_curves] = curve_dict["is_closed"][:n_curves].to(
-                device
-            )
-            labels_batch[i, :n_curves] = curve_dict["labels"][:n_curves].to(device)
+            curve_points_batch[i, :n_curves] = curve_dict["curve_points"][:n_curves].to(device, non_blocking=True)
+            is_closed_batch[i, :n_curves] = curve_dict["is_closed"][:n_curves].to(device, non_blocking=True)
+            labels_batch[i, :n_curves] = curve_dict["labels"][:n_curves].to(device, non_blocking=True)
             mask_batch[i, :n_curves] = True
 
-            # Extract endpoint coordinates for open curves
-            endpoint_indices = curve_dict["endpoints"][:n_curves].long()  # [N, 2]
-            curve_points = curve_dict["curve_points"][:n_curves]  # [N, 34, 3]
-            is_closed = curve_dict["is_closed"][:n_curves]  # [N]
+            endpoint_indices = curve_dict["endpoints"][:n_curves].long()
+            curve_points = curve_dict["curve_points"][:n_curves]
+            is_closed = curve_dict["is_closed"][:n_curves]
             
             for j in range(n_curves):
-                if not is_closed[j]:  # Only for open curves
+                if not is_closed[j]:
                     idx0, idx1 = endpoint_indices[j]
                     idx0 = idx0.clamp(min=0, max=33)
                     idx1 = idx1.clamp(min=0, max=33)
                     endpoints_batch[i, j, 0] = curve_points[j, idx0]
                     endpoints_batch[i, j, 1] = curve_points[j, idx1]
-                # For closed curves, endpoints remain zeros
 
-            # Handle weighting
             if "curve_length_weighting" in curve_dict:
                 weighting_batch[i, :n_curves] = curve_dict["curve_length_weighting"][
                     :n_curves
-                ].to(device)
+                ].to(device, non_blocking=True)
 
         processed_curves = {
             "curve_points": curve_points_batch,
@@ -881,15 +779,12 @@ def process_batch_data(data_item, config, device):
             "weighting": weighting_batch,
         }
 
-    # ===== Process Patches =====
+    # Process Patches
     if len(target_patches_list) > 0:
         batch_size = len(target_patches_list)
-
-        # Find max number of patches in this batch
         max_n_patches = max([len(p["patch_points"]) for p in target_patches_list])
-        max_n_patches = min(max_n_patches, config.MAX_PATCHES)  # Cap at config limit
+        max_n_patches = min(max_n_patches, config.MAX_PATCHES)
 
-        # Initialize batch tensors
         patch_points_batch = torch.zeros(
             batch_size, max_n_patches, 400, 3, device=device
         )
@@ -912,29 +807,22 @@ def process_batch_data(data_item, config, device):
             batch_size, max_n_patches, dtype=torch.float, device=device
         )
 
-        # Fill batch tensors
         for i, patch_dict in enumerate(target_patches_list):
             n_patches = min(len(patch_dict["patch_points"]), max_n_patches)
 
-            # Handle list structure for patch points and normals
             for j in range(n_patches):
-                patch_points_batch[i, j] = patch_dict["patch_points"][j].to(device)
-                patch_normals_batch[i, j] = patch_dict["patch_normals"][j].to(device)
+                patch_points_batch[i, j] = patch_dict["patch_points"][j].to(device, non_blocking=True)
+                patch_normals_batch[i, j] = patch_dict["patch_normals"][j].to(device, non_blocking=True)
 
-            u_closed_batch[i, :n_patches] = patch_dict["u_closed"][:n_patches].to(
-                device
-            )
-            v_closed_batch[i, :n_patches] = patch_dict["v_closed"][:n_patches].to(
-                device
-            )
-            labels_batch[i, :n_patches] = patch_dict["labels"][:n_patches].to(device)
+            u_closed_batch[i, :n_patches] = patch_dict["u_closed"][:n_patches].to(device, non_blocking=True)
+            v_closed_batch[i, :n_patches] = patch_dict["v_closed"][:n_patches].to(device, non_blocking=True)
+            labels_batch[i, :n_patches] = patch_dict["labels"][:n_patches].to(device, non_blocking=True)
             mask_batch[i, :n_patches] = True
 
-            # Handle weighting
             if "patch_area_weighting" in patch_dict:
                 weighting_batch[i, :n_patches] = patch_dict["patch_area_weighting"][
                     :n_patches
-                ].to(device)
+                ].to(device, non_blocking=True)
 
         processed_patches = {
             "patch_points": patch_points_batch,
@@ -948,29 +836,17 @@ def process_batch_data(data_item, config, device):
 
     return processed_curves, processed_patches
 
+
 def compute_patch_metrics(pred, target, mask):
-    """
-    计算Patch的评估指标（不用于训练，只用于评估）
-
-    Args:
-        pred: 预测结果字典，包含 points, normals, u_closed_logits, v_closed_logits,
-              label_logits, validity_logits
-        target: 目标数据字典，包含 points, normals, u_closed, v_closed, labels
-        mask: 有效patch的mask [B, N]
-
-    Returns:
-        metrics: 包含各种评估指标的字典
-    """
+    """Compute patch evaluation metrics"""
     metrics = {}
 
-    # 1. 重建误差 - Points (越小越好)
     recon_error_points = F.mse_loss(pred["points"], target["points"], reduction="none")
     recon_error_points = (
         recon_error_points * mask.unsqueeze(-1).unsqueeze(-1)
     ).sum() / mask.sum().clamp(min=1)
     metrics["recon_error"] = recon_error_points.item()
 
-    # 2. 重建误差 - Normals (越小越好)
     recon_error_normals = F.mse_loss(
         pred["normals"], target["normals"], reduction="none"
     )
@@ -979,58 +855,42 @@ def compute_patch_metrics(pred, target, mask):
     ).sum() / mask.sum().clamp(min=1)
     metrics["recon_error_normals"] = recon_error_normals.item()
 
-    # 3. 标签分类准确率 (越高越好)
     pred_labels = torch.argmax(pred["label_logits"], dim=-1)
     correct_labels = (pred_labels == target["labels"]) & mask
     label_accuracy = correct_labels.sum().float() / mask.sum().float()
     metrics["label_accuracy"] = label_accuracy.item()
 
-    # 4. U方向闭合预测准确率 (越高越好)
     pred_u_closed = torch.sigmoid(pred["u_closed_logits"]) > 0.5
     correct_u = (pred_u_closed == target["u_closed"]) & mask
     u_closed_accuracy = correct_u.sum().float() / mask.sum().float()
     metrics["u_closed_accuracy"] = u_closed_accuracy.item()
 
-    # 5. V方向闭合预测准确率 (越高越好)
     pred_v_closed = torch.sigmoid(pred["v_closed_logits"]) > 0.5
     correct_v = (pred_v_closed == target["v_closed"]) & mask
     v_closed_accuracy = correct_v.sum().float() / mask.sum().float()
     metrics["v_closed_accuracy"] = v_closed_accuracy.item()
 
-    # 6. 有效性预测准确率 (预测哪些patch是有效的)
     pred_validity = torch.sigmoid(pred["validity_logits"]) > 0.5
     validity_correct = (pred_validity == mask).sum().float() / pred_validity.numel()
     metrics["validity_accuracy"] = validity_correct.item()
 
-    # 7. 总体拓扑准确率（综合u_closed和v_closed）
     topology_correct = correct_u & correct_v
     topology_accuracy = topology_correct.sum().float() / mask.sum().float()
     metrics["topology_accuracy"] = topology_accuracy.item()
 
     return metrics
 
+
 def compute_curve_metrics(pred, target, mask):
-    """
-    计算Curve的评估指标（不用于训练，只用于评估）
-
-    Args:
-        pred: 预测结果字典，包含 points, endpoints, closed_logits, label_logits, validity_logits
-        target: 目标数据字典，包含 points, endpoints, is_closed, labels
-        mask: 有效curve的mask [B, N]
-
-    Returns:
-        metrics: 包含各种评估指标的字典
-    """
+    """Compute curve evaluation metrics"""
     metrics = {}
 
-    # 1. 重建误差 - Curve Points (越小越好)
     recon_error_points = F.mse_loss(pred["points"], target["points"], reduction="none")
     recon_error_points = (
         recon_error_points * mask.unsqueeze(-1).unsqueeze(-1)
     ).sum() / mask.sum().clamp(min=1)
     metrics["recon_error"] = recon_error_points.item()
 
-    # 2. 重建误差 - Endpoints (越小越好)
     recon_error_endpoints = F.mse_loss(
         pred["endpoints"], target["endpoints"], reduction="none"
     )
@@ -1039,24 +899,20 @@ def compute_curve_metrics(pred, target, mask):
     ).sum() / mask.sum().clamp(min=1)
     metrics["recon_error_endpoints"] = recon_error_endpoints.item()
 
-    # 3. 标签分类准确率 (越高越好)
     pred_labels = torch.argmax(pred["label_logits"], dim=-1)
     correct_labels = (pred_labels == target["labels"]) & mask
     label_accuracy = correct_labels.sum().float() / mask.sum().float()
     metrics["label_accuracy"] = label_accuracy.item()
 
-    # 4. 闭合标志预测准确率 (越高越好)
     pred_closed = torch.sigmoid(pred["closed_logits"]) > 0.5
     correct_closed = (pred_closed == target["is_closed"]) & mask
     closed_accuracy = correct_closed.sum().float() / mask.sum().float()
     metrics["closed_accuracy"] = closed_accuracy.item()
 
-    # 5. 有效性预测准确率 (预测哪些curve是有效的)
     pred_validity = torch.sigmoid(pred["validity_logits"]) > 0.5
     validity_correct = (pred_validity == mask).sum().float() / pred_validity.numel()
     metrics["validity_accuracy"] = validity_correct.item()
 
-    # 6. Endpoint预测误差（单独统计起点和终点）
     start_point_error = F.mse_loss(
         pred["endpoints"][:, :, 0], target["endpoints"][:, :, 0], reduction="none"
     )
@@ -1075,26 +931,74 @@ def compute_curve_metrics(pred, target, mask):
 
     return metrics
 
+
+class LossAccumulator:
+    """Accumulate losses without frequent CPU-GPU sync"""
+    def __init__(self):
+        self.losses = {}
+        
+    def add(self, loss_dict):
+        for key, val in loss_dict.items():
+            if key not in self.losses:
+                self.losses[key] = []
+            # Keep as tensor, don't call .item() yet
+            self.losses[key].append(val.detach())
+    
+    def get_averages(self):
+        """Convert to CPU and compute averages only when needed"""
+        averages = {}
+        for key, vals in self.losses.items():
+            if vals:
+                stacked = torch.stack(vals)
+                averages[key] = stacked.mean().item()
+        return averages
+    
+    def reset(self):
+        self.losses = {}
+
+
 def train_pipeline(rank, num_gpus, args, config):
-    """
-    Complete training pipeline with data loading and distributed setup
-    """
+    """Complete training pipeline with performance optimization"""
     dist.init_process_group(
         backend="nccl",
         init_method="tcp://127.0.0.1:23257",
         world_size=num_gpus,
         rank=rank,
     )
-    # ===== Setup distributed training =====
+    
     if num_gpus > 1:
         torch.cuda.set_device(rank)
         device = f"cuda:{rank}"
     else:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    if rank == 0:
-        print(f"Training on {num_gpus} GPU(s)")
+    # Setup experiment directory
+    experiment_dir = os.path.join("experiments", args.experiment_name)
+    args.checkpoint_dir = os.path.join(experiment_dir, "ckpt")
 
+    if rank == 0:
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
+        
+        logger = setup_logger(experiment_dir)
+        logger.info(f"Experiment: {args.experiment_name}")
+        logger.info(f"Training on {num_gpus} GPU(s)")
+        logger.info(f"Mixed Precision: {config.USE_AMP}")
+        logger.info(f"Gradient Accumulation Steps: {config.GRADIENT_ACCUMULATION_STEPS}")
+        
+        wandb.init(
+            project="vae-cad-reconstruction",
+            name=args.experiment_name,
+            config={
+                "d_model": config.D_MODEL,
+                "curve_latent_dim": config.CURVE_LATENT_DIM,
+                "patch_latent_dim": config.PATCH_LATENT_DIM,
+                "learning_rate": config.LEARNING_RATE,
+                "batch_size": args.batch_size,
+                "use_amp": config.USE_AMP,
+            }
+        )
+
+    # Load data with optimization
     if args.quicktest:
         train_data, distribute_sampler = train_data_loader(
             args.batch_size,
@@ -1130,7 +1034,6 @@ def train_pipeline(rank, num_gpus, args, config):
             eval_res_cov=args.extra_single_chamfer,
         )
     else:
-        # Training data
         if args.parsenet:
             train_folder = (
                 "data/partial/train" if args.partial else "data/default/train"
@@ -1153,7 +1056,6 @@ def train_pipeline(rank, num_gpus, args, config):
                 eval_res_cov=args.extra_single_chamfer,
             )
 
-        # Validation data
         if not args.patch_grid:
             val_folder = "val_new_64"
         else:
@@ -1176,22 +1078,12 @@ def train_pipeline(rank, num_gpus, args, config):
             eval_res_cov=args.extra_single_chamfer,
         )
 
-    # ===== Setup experiment directories =====
-    experiment_dir = os.path.join("experiments", args.experiment_name)
-    args.checkpoint_dir = os.path.join(experiment_dir, "ckpt")
-
-    if rank == 0:
-        os.makedirs(args.checkpoint_dir, exist_ok=True)
-        print(f"Experiment directory: {experiment_dir}")
-        print(f"Checkpoints will be saved to: {args.checkpoint_dir}")
-
-    # ===== Initialize models =====
+    # Initialize models
     patch_encoder = PatchEncoder(config).to(device)
     patch_decoder = PatchDecoder(config).to(device)
     curve_encoder = CurveEncoder(config).to(device)
     curve_decoder = CurveDecoder(config).to(device)
 
-    # Wrap with DDP if multi-GPU
     if num_gpus > 1:
         patch_encoder = nn.parallel.DistributedDataParallel(
             patch_encoder, device_ids=[rank]
@@ -1206,7 +1098,7 @@ def train_pipeline(rank, num_gpus, args, config):
             curve_decoder, device_ids=[rank]
         )
 
-    # ===== Initialize optimizers =====
+    # Initialize optimizers
     patch_params = list(patch_encoder.parameters()) + list(patch_decoder.parameters())
     curve_params = list(curve_encoder.parameters()) + list(curve_decoder.parameters())
 
@@ -1217,12 +1109,15 @@ def train_pipeline(rank, num_gpus, args, config):
         curve_params, lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY
     )
 
-    # ===== Initialize schedulers =====
+    # Initialize mixed precision scalers
+    patch_scaler = GradScaler() if config.USE_AMP else None
+    curve_scaler = GradScaler() if config.USE_AMP else None
+
     kl_scheduler = KLScheduler(
         config.KL_WEIGHT_START, config.KL_WEIGHT_END, config.KL_WARMUP_EPOCHS
     )
 
-    # ===== Load checkpoint if specified =====
+    # Load checkpoint if specified
     start_epoch = 0
     if (
         hasattr(args, "checkpoint_path")
@@ -1230,7 +1125,7 @@ def train_pipeline(rank, num_gpus, args, config):
         and os.path.exists(args.checkpoint_path)
     ):
         if rank == 0:
-            print(f"Loading checkpoint from {args.checkpoint_path}")
+            logger.info(f"Loading checkpoint from {args.checkpoint_path}")
         checkpoint = torch.load(args.checkpoint_path, map_location=device)
         patch_encoder.load_state_dict(checkpoint["patch_encoder"])
         patch_decoder.load_state_dict(checkpoint["patch_decoder"])
@@ -1238,202 +1133,248 @@ def train_pipeline(rank, num_gpus, args, config):
         curve_decoder.load_state_dict(checkpoint["curve_decoder"])
         patch_optimizer.load_state_dict(checkpoint["patch_optimizer"])
         curve_optimizer.load_state_dict(checkpoint["curve_optimizer"])
+        if config.USE_AMP and "patch_scaler" in checkpoint:
+            patch_scaler.load_state_dict(checkpoint["patch_scaler"])
+            curve_scaler.load_state_dict(checkpoint["curve_scaler"])
         start_epoch = checkpoint["epoch"] + 1
 
-    # ===== Training loop =====
+    # Training loop
     best_val_loss = float("inf")
+    cur_epochs = start_epoch 
 
     for epoch in range(start_epoch, args.max_training_iterations):
-        # Get current KL weight
         current_kl_weight = kl_scheduler.get_weight(epoch)
 
         if rank == 0:
-            print(
-                f"\nEpoch {epoch+1}/{args.max_training_iterations} - KL Weight: {current_kl_weight:.4f}"
-            )
+            logger.info(f"Epoch {epoch+1}/{args.max_training_iterations} - KL Weight: {current_kl_weight:.4f}")
 
-        # Set models to training mode
+        if distribute_sampler is not None:
+            distribute_sampler.set_epoch(cur_epochs)
+
         patch_encoder.train()
         patch_decoder.train()
         curve_encoder.train()
         curve_decoder.train()
 
-        # Training epoch
-        patch_losses_all = []
-        curve_losses_all = []
+        # Use loss accumulators to avoid frequent CPU sync
+        patch_loss_acc = LossAccumulator()
+        curve_loss_acc = LossAccumulator()
+
+        data_loader_iterator = iter(train_data)
 
         if rank == 0:
-            pbar = tqdm(train_data, desc=f"Epoch {epoch+1} [Train]")
+            pbar = tqdm(range(len(train_data)), desc=f"Epoch {epoch+1}", leave=True, dynamic_ncols=True)
         else:
-            pbar = train_data
+            pbar = range(len(train_data))
 
-        for batch_idx, data_item in enumerate(pbar):
-            # Process batch data
+        for batch_idx in pbar:
+            try:
+                data_item = next(data_loader_iterator)
+            except StopIteration:
+                data_loader_iterator = iter(train_data)
+                data_item = next(data_loader_iterator)
+                cur_epochs += 1
+                if distribute_sampler is not None:
+                    distribute_sampler.set_epoch(cur_epochs)
+
             processed_curves, processed_patches = process_batch_data(
                 data_item, config, device
             )
 
-            # ===== Patch VAE Training =====
+            # Patch VAE training with mixed precision
             if processed_patches is not None:
-                # Forward pass
-                mean_p, logvar_p = patch_encoder(
-                    processed_patches["patch_points"],
-                    processed_patches["patch_normals"],
-                    processed_patches["u_closed"],
-                    processed_patches["v_closed"],
-                    processed_patches["labels"],
-                    processed_patches["mask"],
-                )
+                with autocast() if config.USE_AMP else torch.cuda.amp.autocast(enabled=False):
+                    mean_p, logvar_p = patch_encoder(
+                        processed_patches["patch_points"],
+                        processed_patches["patch_normals"],
+                        processed_patches["u_closed"],
+                        processed_patches["v_closed"],
+                        processed_patches["labels"],
+                        processed_patches["mask"],
+                    )
 
-                # Reparameterization
-                std_p = torch.exp(0.5 * logvar_p)
-                eps_p = torch.randn_like(std_p)
-                z_p = mean_p + eps_p * std_p
+                    std_p = torch.exp(0.5 * logvar_p)
+                    eps_p = torch.randn_like(std_p)
+                    z_p = mean_p + eps_p * std_p
 
-                # Decode
-                pred_patch = patch_decoder(z_p)
+                    pred_patch = patch_decoder(z_p)
 
-                # Compute losses with weighting
-                target_patch = {
-                    "points": processed_patches["patch_points"],
-                    "normals": processed_patches["patch_normals"],
-                    "u_closed": processed_patches["u_closed"],
-                    "v_closed": processed_patches["v_closed"],
-                    "labels": processed_patches["labels"],
-                }
+                    target_patch = {
+                        "points": processed_patches["patch_points"], #[B N 400 3]
+                        "normals": processed_patches["patch_normals"], #[B N 400 3]
+                        "u_closed": processed_patches["u_closed"],  #[B N]
+                        "v_closed": processed_patches["v_closed"], #[B N]
+                        "labels": processed_patches["labels"], #[B N]
+                    }
 
-                patch_losses = compute_patch_vae_loss(
-                    pred_patch,
-                    target_patch,
-                    mean_p,
-                    logvar_p,
-                    processed_patches["mask"],
-                    current_kl_weight,
-                    config,
-                    weighting=processed_patches["weighting"],
-                )
+                    patch_losses = compute_patch_vae_loss(
+                        pred_patch,
+                        target_patch,
+                        mean_p,
+                        logvar_p,
+                        processed_patches["mask"],
+                        current_kl_weight,
+                        config,
+                        weighting=processed_patches["weighting"],
+                    )
 
-                # Backward pass
-                patch_optimizer.zero_grad()
-                patch_losses["total"].backward()
-                torch.nn.utils.clip_grad_norm_(
-                    patch_params, max_norm=config.GRAD_CLIP_NORM
-                )
-                patch_optimizer.step()
+                loss = patch_losses["total"] / config.GRADIENT_ACCUMULATION_STEPS
 
-                patch_losses_all.append(patch_losses["total"].item())
+                if config.USE_AMP:
+                    patch_scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
-            # ===== Curve VAE Training =====
+                if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
+                    if config.USE_AMP:
+                        patch_scaler.unscale_(patch_optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            patch_params, max_norm=config.GRAD_CLIP_NORM
+                        )
+                        patch_scaler.step(patch_optimizer)
+                        patch_scaler.update()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(
+                            patch_params, max_norm=config.GRAD_CLIP_NORM
+                        )
+                        patch_optimizer.step()
+                    
+                    patch_optimizer.zero_grad()
+
+                patch_loss_acc.add(patch_losses)
+
+            # Curve VAE training with mixed precision
             if processed_curves is not None:
-                # Forward pass
-                mean_c, logvar_c = curve_encoder(
-                    processed_curves["curve_points"],
-                    processed_curves["endpoints"],
-                    processed_curves["is_closed"],
-                    processed_curves["labels"],
-                    processed_curves["mask"],
-                )
+                with autocast() if config.USE_AMP else torch.cuda.amp.autocast(enabled=False):
+                    mean_c, logvar_c = curve_encoder(
+                        processed_curves["curve_points"],
+                        processed_curves["endpoints"],
+                        processed_curves["is_closed"],
+                        processed_curves["labels"],
+                        processed_curves["mask"],
+                    )
 
-                # Reparameterization
-                std_c = torch.exp(0.5 * logvar_c)
-                eps_c = torch.randn_like(std_c)
-                z_c = mean_c + eps_c * std_c
+                    std_c = torch.exp(0.5 * logvar_c)
+                    eps_c = torch.randn_like(std_c)
+                    z_c = mean_c + eps_c * std_c
 
-                # Decode
-                pred_curve = curve_decoder(z_c)
+                    pred_curve = curve_decoder(z_c)
 
-                # Compute losses with weighting
-                target_curve = {
-                    "points": processed_curves["curve_points"],
-                    "endpoints": processed_curves["endpoints"],
-                    "is_closed": processed_curves["is_closed"],
-                    "labels": processed_curves["labels"],
-                }
+                    target_curve = {
+                        "points": processed_curves["curve_points"],
+                        "endpoints": processed_curves["endpoints"],
+                        "is_closed": processed_curves["is_closed"],
+                        "labels": processed_curves["labels"],
+                    }
 
-                curve_losses = compute_curve_vae_loss(
-                    pred_curve,
-                    target_curve,
-                    mean_c,
-                    logvar_c,
-                    processed_curves["mask"],
-                    current_kl_weight,
-                    config,
-                    weighting=processed_curves["weighting"],
-                )
+                    curve_losses = compute_curve_vae_loss(
+                        pred_curve,
+                        target_curve,
+                        mean_c,
+                        logvar_c,
+                        processed_curves["mask"],
+                        current_kl_weight,
+                        config,
+                        weighting=processed_curves["weighting"],
+                    )
 
-                # Backward pass
-                curve_optimizer.zero_grad()
-                curve_losses["total"].backward()
-                torch.nn.utils.clip_grad_norm_(
-                    curve_params, max_norm=config.GRAD_CLIP_NORM
-                )
-                curve_optimizer.step()
+                loss = curve_losses["total"] / config.GRADIENT_ACCUMULATION_STEPS
 
-                curve_losses_all.append(curve_losses["total"].item())
+                if config.USE_AMP:
+                    curve_scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
-            # Update progress bar
-            if rank == 0:
+                if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
+                    if config.USE_AMP:
+                        curve_scaler.unscale_(curve_optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            curve_params, max_norm=config.GRAD_CLIP_NORM
+                        )
+                        curve_scaler.step(curve_optimizer)
+                        curve_scaler.update()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(
+                            curve_params, max_norm=config.GRAD_CLIP_NORM
+                        )
+                        curve_optimizer.step()
+                    
+                    curve_optimizer.zero_grad()
+
+                curve_loss_acc.add(curve_losses)
+
+            # Update progress bar less frequently
+            if rank == 0 and (batch_idx + 1) % config.LOG_INTERVAL == 0:
+                patch_avgs = patch_loss_acc.get_averages()
+                curve_avgs = curve_loss_acc.get_averages()
                 postfix = {}
-                if patch_losses_all:
-                    postfix["patch_loss"] = f"{patch_losses_all[-1]:.4f}"
-                if curve_losses_all:
-                    postfix["curve_loss"] = f"{curve_losses_all[-1]:.4f}"
-                if postfix:
+                if "total" in patch_avgs:
+                    postfix["P_loss"] = f"{patch_avgs['total']:.4f}"
+                if "total" in curve_avgs:
+                    postfix["C_loss"] = f"{curve_avgs['total']:.4f}"
+                if postfix and isinstance(pbar, tqdm):
                     pbar.set_postfix(postfix)
 
-        # Compute average losses
-        avg_patch_loss = (
-            sum(patch_losses_all) / len(patch_losses_all) if patch_losses_all else 0
-        )
-        avg_curve_loss = (
-            sum(curve_losses_all) / len(curve_losses_all) if curve_losses_all else 0
-        )
+        cur_epochs += 1
+
+        # Compute epoch averages (single CPU sync per epoch)
+        avg_patch_losses = patch_loss_acc.get_averages()
+        avg_curve_losses = curve_loss_acc.get_averages()
 
         if rank == 0:
-            print(
-                f"Epoch {epoch+1} - Avg Patch Loss: {avg_patch_loss:.4f}, Avg Curve Loss: {avg_curve_loss:.4f}"
-            )
+            # Log to wandb
+            log_dict = {
+                "epoch": epoch + 1,
+                "kl_weight": current_kl_weight,
+            }
+            
+            for key, val in avg_patch_losses.items():
+                log_dict[f"train/patch_{key}"] = val
+            
+            for key, val in avg_curve_losses.items():
+                log_dict[f"train/curve_{key}"] = val
+            
+            wandb.log(log_dict)
+            
+            logger.info(f"Epoch {epoch+1} - Train Patch Loss: {avg_patch_losses.get('total', 0):.4f}, Train Curve Loss: {avg_curve_losses.get('total', 0):.4f}")
 
         # Validation
         if (epoch + 1) % config.EVAL_INTERVAL == 0:
-            if rank == 0:
-                print("Running validation...")
-
             val_metrics = val_pipeline(
                 patch_encoder,
                 patch_decoder,
                 curve_encoder,
                 curve_decoder,
                 val_data,
+                val_data_sampler, 
+                epoch,  
                 device,
                 config,
+                rank,
             )
 
             if rank == 0:
+                val_log_dict = {"epoch": epoch + 1}
+                
                 if "patch" in val_metrics and val_metrics["patch"]:
-                    print(
-                        f"Validation - Patch Recon Error: {val_metrics['patch']['recon_error']:.6f}"
-                    )
-                    print(
-                        f"Validation - Patch Label Acc: {val_metrics['patch']['label_accuracy']:.4f}"
-                    )
+                    for key, val in val_metrics["patch"].items():
+                        val_log_dict[f"val/patch_{key}"] = val
+                    logger.info(f"Val Patch Recon Error: {val_metrics['patch']['recon_error']:.6f}")
+                
                 if "curve" in val_metrics and val_metrics["curve"]:
-                    print(
-                        f"Validation - Curve Recon Error: {val_metrics['curve']['recon_error']:.6f}"
-                    )
-                    print(
-                        f"Validation - Curve Label Acc: {val_metrics['curve']['label_accuracy']:.4f}"
-                    )
+                    for key, val in val_metrics["curve"].items():
+                        val_log_dict[f"val/curve_{key}"] = val
+                    logger.info(f"Val Curve Recon Error: {val_metrics['curve']['recon_error']:.6f}")
+                
+                wandb.log(val_log_dict)
 
-            # Save best model
-            patch_loss = val_metrics.get("patch", {}).get("recon_error", 0)
-            curve_loss = val_metrics.get("curve", {}).get("recon_error", 0)
-            val_loss = patch_loss + curve_loss
+                patch_loss = val_metrics.get("patch", {}).get("recon_error", 0)
+                curve_loss = val_metrics.get("curve", {}).get("recon_error", 0)
+                val_loss = patch_loss + curve_loss
 
-            if rank == 0 and val_loss < best_val_loss:
-                best_val_loss = val_loss
-                torch.save(
-                    {
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    checkpoint_dict = {
                         "epoch": epoch,
                         "patch_encoder": patch_encoder.state_dict(),
                         "patch_decoder": patch_decoder.state_dict(),
@@ -1442,36 +1383,150 @@ def train_pipeline(rank, num_gpus, args, config):
                         "patch_optimizer": patch_optimizer.state_dict(),
                         "curve_optimizer": curve_optimizer.state_dict(),
                         "val_loss": val_loss,
-                    },
-                    os.path.join(args.checkpoint_dir, "best_model.pth"),
-                )
-                print(f"Saved best model with val_loss: {val_loss:.6f}")
+                    }
+                    if config.USE_AMP:
+                        checkpoint_dict["patch_scaler"] = patch_scaler.state_dict()
+                        checkpoint_dict["curve_scaler"] = curve_scaler.state_dict()
+                    
+                    torch.save(
+                        checkpoint_dict,
+                        os.path.join(args.checkpoint_dir, "best_model.pth"),
+                    )
+                    logger.info(f"Saved best model with val_loss: {val_loss:.6f}")
 
         # Save checkpoint
         if rank == 0 and (epoch + 1) % config.SAVE_INTERVAL == 0:
+            checkpoint_dict = {
+                "epoch": epoch,
+                "patch_encoder": patch_encoder.state_dict(),
+                "patch_decoder": patch_decoder.state_dict(),
+                "curve_encoder": curve_encoder.state_dict(),
+                "curve_decoder": curve_decoder.state_dict(),
+                "patch_optimizer": patch_optimizer.state_dict(),
+                "curve_optimizer": curve_optimizer.state_dict(),
+            }
+            if config.USE_AMP:
+                checkpoint_dict["patch_scaler"] = patch_scaler.state_dict()
+                checkpoint_dict["curve_scaler"] = curve_scaler.state_dict()
+            
             torch.save(
-                {
-                    "epoch": epoch,
-                    "patch_encoder": patch_encoder.state_dict(),
-                    "patch_decoder": patch_decoder.state_dict(),
-                    "curve_encoder": curve_encoder.state_dict(),
-                    "curve_decoder": curve_decoder.state_dict(),
-                    "patch_optimizer": patch_optimizer.state_dict(),
-                    "curve_optimizer": curve_optimizer.state_dict(),
-                },
+                checkpoint_dict,
                 os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth"),
             )
-            print(f"Saved checkpoint for epoch {epoch+1}")
+            logger.info(f"Saved checkpoint for epoch {epoch+1}")
 
+    if rank == 0:
+        wandb.finish()
+
+def val_pipeline(
+    patch_encoder,
+    patch_decoder,
+    curve_encoder,
+    curve_decoder,
+    val_dataloader,
+    val_sampler,  # 添加sampler参数
+    epoch,  # 添加epoch参数
+    device,
+    config,
+    rank=0,
+):
+    """Validation pipeline with sampler support"""
+    # 设置validation sampler的epoch
+    if val_sampler is not None:
+        val_sampler.set_epoch(epoch)
+    
+    patch_encoder.eval()
+    patch_decoder.eval()
+    curve_encoder.eval()
+    curve_decoder.eval()
+
+    patch_metrics_all = []
+    curve_metrics_all = []
+
+    with torch.no_grad():
+        pbar = tqdm(val_dataloader, desc="Validation", leave=False, dynamic_ncols=True) if rank == 0 else val_dataloader
+        for batch_idx, data_item in enumerate(pbar):
+            processed_curves, processed_patches = process_batch_data(
+                data_item, config, device
+            )
+
+            if processed_patches is not None:
+                mean_p, _ = patch_encoder(
+                    processed_patches["patch_points"],
+                    processed_patches["patch_normals"],
+                    processed_patches["u_closed"],
+                    processed_patches["v_closed"],
+                    processed_patches["labels"],
+                    processed_patches["mask"],
+                )
+
+                pred_patch = patch_decoder(mean_p)
+
+                target_patch = {
+                    "points": processed_patches["patch_points"],
+                    "normals": processed_patches["patch_normals"],
+                    "u_closed": processed_patches["u_closed"],
+                    "v_closed": processed_patches["v_closed"],
+                    "labels": processed_patches["labels"],
+                }
+
+                patch_metrics = compute_patch_metrics(
+                    pred_patch, target_patch, processed_patches["mask"]
+                )
+                patch_metrics_all.append(patch_metrics)
+
+            if processed_curves is not None:
+                mean_c, _ = curve_encoder(
+                    processed_curves["curve_points"],
+                    processed_curves["endpoints"],
+                    processed_curves["is_closed"],
+                    processed_curves["labels"],
+                    processed_curves["mask"],
+                )
+
+                pred_curve = curve_decoder(mean_c)
+
+                target_curve = {
+                    "points": processed_curves["curve_points"],
+                    "endpoints": processed_curves["endpoints"],
+                    "is_closed": processed_curves["is_closed"],
+                    "labels": processed_curves["labels"],
+                }
+
+                curve_metrics = compute_curve_metrics(
+                    pred_curve, target_curve, processed_curves["mask"]
+                )
+                curve_metrics_all.append(curve_metrics)
+
+    val_metrics = {}
+
+    if patch_metrics_all:
+        avg_patch_metrics = {}
+        for key in patch_metrics_all[0].keys():
+            avg_patch_metrics[key] = sum(m[key] for m in patch_metrics_all) / len(
+                patch_metrics_all
+            )
+        val_metrics["patch"] = avg_patch_metrics
+
+    if curve_metrics_all:
+        avg_curve_metrics = {}
+        for key in curve_metrics_all[0].keys():
+            avg_curve_metrics[key] = sum(m[key] for m in curve_metrics_all) / len(
+                curve_metrics_all
+            )
+        val_metrics["curve"] = avg_curve_metrics
+
+    patch_encoder.train()
+    patch_decoder.train()
+    curve_encoder.train()
+    curve_decoder.train()
+
+    return val_metrics
 
 def eval_pipeline(args, config):
-    """
-    Complete evaluation pipeline with data loading
-    """
+    """Complete evaluation pipeline"""
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
 
-    # ===== Load test data =====
     voxel_dim = config.VOXEL_DIM if hasattr(config, "VOXEL_DIM") else 64
     points_per_patch_dim = (
         config.POINTS_PER_PATCH_DIM if hasattr(config, "POINTS_PER_PATCH_DIM") else 32
@@ -1517,20 +1572,16 @@ def eval_pipeline(args, config):
             eval_res_cov=args.extra_single_chamfer,
         )
 
-    # ===== Setup experiment directories =====
     experiment_dir = os.path.join("experiments", args.experiment_name)
     args.checkpoint_dir = os.path.join(experiment_dir, "ckpt")
 
-    # ===== Initialize models =====
-    print("Initializing models...")
     patch_encoder = PatchEncoder(config).to(device)
     patch_decoder = PatchDecoder(config).to(device)
     curve_encoder = CurveEncoder(config).to(device)
     curve_decoder = CurveDecoder(config).to(device)
 
-    # ===== Load checkpoint =====
     if not hasattr(args, "checkpoint_path") or not args.checkpoint_path:
-        raise ValueError("checkpoint_path must be specified in args for evaluation")
+        raise ValueError("checkpoint_path must be specified for evaluation")
 
     if not os.path.exists(args.checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint_path}")
@@ -1543,30 +1594,20 @@ def eval_pipeline(args, config):
     curve_encoder.load_state_dict(checkpoint["curve_encoder"])
     curve_decoder.load_state_dict(checkpoint["curve_decoder"])
 
-    print(f"✓ Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
-    if "val_loss" in checkpoint:
-        print(f"  Validation loss at checkpoint: {checkpoint['val_loss']:.6f}")
-
-    # ===== Set to evaluation mode =====
     patch_encoder.eval()
     patch_decoder.eval()
     curve_encoder.eval()
     curve_decoder.eval()
 
-    # ===== Run evaluation on test set =====
-    print("\nRunning evaluation on test set...")
-    print("=" * 60)
-
     patch_metrics_all = []
     curve_metrics_all = []
 
     with torch.no_grad():
-        for batch_idx, data_item in enumerate(tqdm(test_data, desc="Evaluating")):
+        for batch_idx, data_item in enumerate(tqdm(test_data, desc="Evaluating", leave=True, dynamic_ncols=True)):
             processed_curves, processed_patches = process_batch_data(
                 data_item, config, device
             )
 
-            # Patch evaluation
             if processed_patches is not None:
                 mean_p, _ = patch_encoder(
                     processed_patches["patch_points"],
@@ -1592,7 +1633,6 @@ def eval_pipeline(args, config):
                 )
                 patch_metrics_all.append(patch_metrics)
 
-            # Curve evaluation
             if processed_curves is not None:
                 mean_c, _ = curve_encoder(
                     processed_curves["curve_points"],
@@ -1616,7 +1656,6 @@ def eval_pipeline(args, config):
                 )
                 curve_metrics_all.append(curve_metrics)
 
-    # ===== Compute average metrics =====
     avg_patch_metrics = {}
     avg_curve_metrics = {}
 
@@ -1632,69 +1671,29 @@ def eval_pipeline(args, config):
                 curve_metrics_all
             )
 
-    # ===== Print results =====
     print("\n" + "=" * 60)
-    print("FINAL TEST RESULTS")
+    print("TEST RESULTS")
     print("=" * 60)
 
     if avg_patch_metrics:
-        print("\n📊 PATCH METRICS:")
-        print(
-            f"  • Reconstruction Error (Points):  {avg_patch_metrics['recon_error']:.6f}"
-        )
-        print(
-            f"  • Reconstruction Error (Normals): {avg_patch_metrics['recon_error_normals']:.6f}"
-        )
-        print(
-            f"  • Label Accuracy:                 {avg_patch_metrics['label_accuracy']:.4f} ({avg_patch_metrics['label_accuracy']*100:.2f}%)"
-        )
-        print(
-            f"  • U-Closed Accuracy:              {avg_patch_metrics['u_closed_accuracy']:.4f} ({avg_patch_metrics['u_closed_accuracy']*100:.2f}%)"
-        )
-        print(
-            f"  • V-Closed Accuracy:              {avg_patch_metrics['v_closed_accuracy']:.4f} ({avg_patch_metrics['v_closed_accuracy']*100:.2f}%)"
-        )
-        print(
-            f"  • Topology Accuracy (Overall):    {avg_patch_metrics['topology_accuracy']:.4f} ({avg_patch_metrics['topology_accuracy']*100:.2f}%)"
-        )
-        print(
-            f"  • Validity Accuracy:              {avg_patch_metrics['validity_accuracy']:.4f} ({avg_patch_metrics['validity_accuracy']*100:.2f}%)"
-        )
+        print("\nPATCH METRICS:")
+        for key, val in avg_patch_metrics.items():
+            print(f"  {key}: {val:.6f}")
 
     if avg_curve_metrics:
-        print("\n📈 CURVE METRICS:")
-        print(
-            f"  • Reconstruction Error (Points):  {avg_curve_metrics['recon_error']:.6f}"
-        )
-        print(
-            f"  • Reconstruction Error (Endpoints):{avg_curve_metrics['recon_error_endpoints']:.6f}"
-        )
-        print(
-            f"    - Start Point Error:            {avg_curve_metrics['start_point_error']:.6f}"
-        )
-        print(
-            f"    - End Point Error:              {avg_curve_metrics['end_point_error']:.6f}"
-        )
-        print(
-            f"  • Label Accuracy:                 {avg_curve_metrics['label_accuracy']:.4f} ({avg_curve_metrics['label_accuracy']*100:.2f}%)"
-        )
-        print(
-            f"  • Closed Accuracy:                {avg_curve_metrics['closed_accuracy']:.4f} ({avg_curve_metrics['closed_accuracy']*100:.2f}%)"
-        )
-        print(
-            f"  • Validity Accuracy:              {avg_curve_metrics['validity_accuracy']:.4f} ({avg_curve_metrics['validity_accuracy']*100:.2f}%)"
-        )
+        print("\nCURVE METRICS:")
+        for key, val in avg_curve_metrics.items():
+            print(f"  {key}: {val:.6f}")
 
     print("=" * 60)
 
-    # ===== Save results =====
     test_metrics = {"patch": avg_patch_metrics, "curve": avg_curve_metrics}
 
     if hasattr(args, "experiment_name") and args.experiment_name:
         results_path = os.path.join(args.checkpoint_dir, "test_results.txt")
         with open(results_path, "w") as f:
             f.write("=" * 60 + "\n")
-            f.write("FINAL TEST RESULTS\n")
+            f.write("TEST RESULTS\n")
             f.write("=" * 60 + "\n\n")
 
             if avg_patch_metrics:
@@ -1708,134 +1707,23 @@ def eval_pipeline(args, config):
                 for key, value in avg_curve_metrics.items():
                     f.write(f"  {key}: {value:.6f}\n")
 
-        print(f"\n✓ Results saved to: {results_path}")
+        print(f"\nResults saved to: {results_path}")
 
     return test_metrics
 
 
-def val_pipeline(
-    patch_encoder,
-    patch_decoder,
-    curve_encoder,
-    curve_decoder,
-    val_dataloader,
-    device,
-    config,
-):
-    """
-    Validation pipeline during training
-    """
-    # Set to evaluation mode
-    patch_encoder.eval()
-    patch_decoder.eval()
-    curve_encoder.eval()
-    curve_decoder.eval()
-
-    patch_metrics_all = []
-    curve_metrics_all = []
-
-    with torch.no_grad():
-        for batch_idx, data_item in enumerate(val_dataloader):
-            processed_curves, processed_patches = process_batch_data(
-                data_item, config, device
-            )
-
-            # Patch validation
-            if processed_patches is not None:
-                mean_p, _ = patch_encoder(
-                    processed_patches["patch_points"],
-                    processed_patches["patch_normals"],
-                    processed_patches["u_closed"],
-                    processed_patches["v_closed"],
-                    processed_patches["labels"],
-                    processed_patches["mask"],
-                )
-
-                pred_patch = patch_decoder(mean_p)
-
-                target_patch = {
-                    "points": processed_patches["patch_points"],
-                    "normals": processed_patches["patch_normals"],
-                    "u_closed": processed_patches["u_closed"],
-                    "v_closed": processed_patches["v_closed"],
-                    "labels": processed_patches["labels"],
-                }
-
-                patch_metrics = compute_patch_metrics(
-                    pred_patch, target_patch, processed_patches["mask"]
-                )
-                patch_metrics_all.append(patch_metrics)
-
-            # Curve validation
-            if processed_curves is not None:
-                mean_c, _ = curve_encoder(
-                    processed_curves["curve_points"],
-                    processed_curves["endpoints"],
-                    processed_curves["is_closed"],
-                    processed_curves["labels"],
-                    processed_curves["mask"],
-                )
-
-                pred_curve = curve_decoder(mean_c)
-
-                target_curve = {
-                    "points": processed_curves["curve_points"],
-                    "endpoints": processed_curves["endpoints"],
-                    "is_closed": processed_curves["is_closed"],
-                    "labels": processed_curves["labels"],
-                }
-
-                curve_metrics = compute_curve_metrics(
-                    pred_curve, target_curve, processed_curves["mask"]
-                )
-                curve_metrics_all.append(curve_metrics)
-
-    # Compute average metrics
-    val_metrics = {}
-
-    if patch_metrics_all:
-        avg_patch_metrics = {}
-        for key in patch_metrics_all[0].keys():
-            avg_patch_metrics[key] = sum(m[key] for m in patch_metrics_all) / len(
-                patch_metrics_all
-            )
-        val_metrics["patch"] = avg_patch_metrics
-
-    if curve_metrics_all:
-        avg_curve_metrics = {}
-        for key in curve_metrics_all[0].keys():
-            avg_curve_metrics[key] = sum(m[key] for m in curve_metrics_all) / len(
-                curve_metrics_all
-            )
-        val_metrics["curve"] = avg_curve_metrics
-
-    # Restore training mode
-    patch_encoder.train()
-    patch_decoder.train()
-    curve_encoder.train()
-    curve_decoder.train()
-
-    return val_metrics
-
-
 if __name__ == "__main__":
-    # Enable anomaly detection
     torch.autograd.set_detect_anomaly(True)
 
-    # Parse arguments
     parser = argparse.ArgumentParser(
         "Training and evaluation script", parents=[get_args_parser()]
     )
     args = parser.parse_args()
 
-    # Get number of GPUs
     num_of_gpus = torch.cuda.device_count()
-    print(f"Utilize {num_of_gpus} GPU(s)")
 
-    # Get config
     config = Config()
 
-    # Simple if-else: eval or train
     if args.eval:
         eval_pipeline(args, config)
     else:
