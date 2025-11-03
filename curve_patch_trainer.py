@@ -27,7 +27,6 @@ from Minkowski_backbone import (
 )
 from data_loader_abc import *
 
-
 class Config:
     # Model Architecture
     D_MODEL = 384 
@@ -45,6 +44,7 @@ class Config:
     POINTS_PER_PATCH_DIM = 20
     MAX_CURVES = 100
     MAX_PATCHES = 50 
+    
     # HyperNetwork
     HN_PE_DIM = 64
     HN_MLP_DIM = 128
@@ -57,22 +57,23 @@ class Config:
     CURVE_NUM_CLASSES = 4
     PATCH_NUM_CLASSES = 6
 
-    # VAE
+    # VAE - 关键修改
     KL_WEIGHT_START = 0.0
-    KL_WEIGHT_END = 0.1
-    KL_WARMUP_EPOCHS = 20
+    KL_WEIGHT_END = 0.0001  # 从0.1改为0.0001
+    KL_WARMUP_EPOCHS = 100  # 从20改为100
+    KL_FREE_BITS = 0.5  # Free bits per dimension
 
     # Training Optimization
-    LEARNING_RATE = 5e-4
+    LEARNING_RATE = 1e-3
     WEIGHT_DECAY = 1e-5
     GRAD_CLIP_NORM = 1.0
-    EVAL_INTERVAL = 50
+    EVAL_INTERVAL = 10  
     SAVE_INTERVAL = 50
     
     # Performance Optimization
-    USE_AMP = False  # Mixed precision training
-    GRADIENT_ACCUMULATION_STEPS = 2  # Accumulate gradients
-    LOG_INTERVAL = 200  # Log every N batches to reduce sync
+    USE_AMP = False
+    GRADIENT_ACCUMULATION_STEPS = 2
+    LOG_INTERVAL = 200
 
     # Loss weights
     RECON_WEIGHT = 1.0
@@ -82,11 +83,10 @@ class Config:
     VALIDITY_WEIGHT = 0.1
 
     # Experimental options
-    USE_TRANSFORMER = False
+    USE_TRANSFORMER = False  
     USE_FOCAL_LOSS = False
     FOCAL_ALPHA = 0.25
     FOCAL_GAMMA = 2.0
-
 
 def setup_logger(log_dir, rank=0):
     """Setup file logger"""
@@ -184,7 +184,6 @@ class PointNetEncoder(nn.Module):
 
         return features
 
-
 class CurveEncoder(nn.Module):
     def __init__(self, config=Config):
         super().__init__()
@@ -270,7 +269,6 @@ class CurveEncoder(nn.Module):
 
         return mean, logvar
 
-
 class CurveDecoder(nn.Module):
     def __init__(self, config=Config):
         super().__init__()
@@ -341,7 +339,6 @@ class CurveDecoder(nn.Module):
             "label_logits": label_logits,  #[B N]
             "validity_logits": validity_logits, #[B N]
         }
-
 
 class PatchEncoder(nn.Module):
     def __init__(self, config=Config):
@@ -420,7 +417,6 @@ class PatchEncoder(nn.Module):
         logvar = torch.clamp(logvar, min=-10, max=10)
 
         return mean, logvar
-
 
 class PatchDecoder(nn.Module):
     def __init__(self, config=Config):
@@ -509,9 +505,8 @@ class PatchDecoder(nn.Module):
             "validity_logits": validity_logits,
         }
 
-
 class KLScheduler:
-    def __init__(self, start_weight=0.0, end_weight=0.1, warmup_epochs=10):
+    def __init__(self, start_weight=0.0, end_weight=0.0001, warmup_epochs=100):
         self.start = start_weight
         self.end = end_weight
         self.warmup = warmup_epochs
@@ -519,8 +514,9 @@ class KLScheduler:
     def get_weight(self, epoch):
         if epoch >= self.warmup:
             return self.end
-        return self.start + (self.end - self.start) * (epoch / self.warmup)
-
+        
+        progress = math.sqrt(epoch / self.warmup)
+        return self.start + (self.end - self.start) * progress
 
 def focal_loss(logits, targets, alpha=0.25, gamma=2.0, reduction="mean"):
     """Focal Loss for class imbalance"""
@@ -544,15 +540,21 @@ def focal_loss(logits, targets, alpha=0.25, gamma=2.0, reduction="mean"):
         return focal_loss.sum()
     return focal_loss
 
-
 def compute_patch_vae_loss(
     pred, target, mean, logvar, mask, kl_weight, config, weighting=None
 ):
     """Compute patch VAE losses"""
     losses = {}
 
-    kl = -0.5 * (1 + logvar - mean.pow(2) - logvar.exp())
-    kl = (kl * mask.unsqueeze(-1).float()).sum() / mask.sum().clamp(min=1)
+    kl_per_dim = -0.5 * (1 + logvar - mean.pow(2) - logvar.exp())
+    
+    free_bits = torch.tensor(config.KL_FREE_BITS, device=kl_per_dim.device)
+    kl_per_dim = torch.max(kl_per_dim, free_bits)
+    
+    kl = kl_per_dim.sum(dim=-1)  # [B, N]
+    kl = (kl * mask.float()).sum() / mask.sum().clamp(min=1)
+    
+    kl = kl / config.PATCH_LATENT_DIM
     losses["kl"] = kl
 
     if weighting is not None:
@@ -577,29 +579,15 @@ def compute_patch_vae_loss(
     )
     topo_weight = topo_weight * mask.float()
 
-    if hasattr(config, "USE_FOCAL_LOSS") and config.USE_FOCAL_LOSS:
-        u_closed_loss = focal_loss(
-            pred["u_closed_logits"],
-            target["u_closed"],
-            getattr(config, "FOCAL_ALPHA", 0.25),
-            getattr(config, "FOCAL_GAMMA", 2.0),
-        )
-        v_closed_loss = focal_loss(
-            pred["v_closed_logits"],
-            target["v_closed"],
-            getattr(config, "FOCAL_ALPHA", 0.25),
-            getattr(config, "FOCAL_GAMMA", 2.0),
-        )
-    else:
-        u_closed_loss = F.binary_cross_entropy_with_logits(
-            pred["u_closed_logits"], target["u_closed"].float(), reduction="none"
-        )
-        u_closed_loss = (u_closed_loss * topo_weight).sum() / mask.sum().clamp(min=1)
+    u_closed_loss = F.binary_cross_entropy_with_logits(
+        pred["u_closed_logits"], target["u_closed"].float(), reduction="none"
+    )
+    u_closed_loss = (u_closed_loss * topo_weight).sum() / mask.sum().clamp(min=1)
 
-        v_closed_loss = F.binary_cross_entropy_with_logits(
-            pred["v_closed_logits"], target["v_closed"].float(), reduction="none"
-        )
-        v_closed_loss = (v_closed_loss * topo_weight).sum() / mask.sum().clamp(min=1)
+    v_closed_loss = F.binary_cross_entropy_with_logits(
+        pred["v_closed_logits"], target["v_closed"].float(), reduction="none"
+    )
+    v_closed_loss = (v_closed_loss * topo_weight).sum() / mask.sum().clamp(min=1)
 
     losses["u_closed"] = u_closed_loss
     losses["v_closed"] = v_closed_loss
@@ -629,15 +617,21 @@ def compute_patch_vae_loss(
 
     return losses
 
-
 def compute_curve_vae_loss(
     pred, target, mean, logvar, mask, kl_weight, config, weighting=None
 ):
     """Compute curve VAE losses"""
     losses = {}
 
-    kl = -0.5 * (1 + logvar - mean.pow(2) - logvar.exp())
-    kl = (kl * mask.unsqueeze(-1).float()).sum() / mask.sum().clamp(min=1)
+    kl_per_dim = -0.5 * (1 + logvar - mean.pow(2) - logvar.exp())
+    
+    free_bits = torch.tensor(config.KL_FREE_BITS, device=kl_per_dim.device)
+    kl_per_dim = torch.max(kl_per_dim, free_bits)
+    
+    kl = kl_per_dim.sum(dim=-1)  # [B, N]
+    kl = (kl * mask.float()).sum() / mask.sum().clamp(min=1)
+    
+    kl = kl / config.CURVE_LATENT_DIM
     losses["kl"] = kl
 
     if weighting is not None:
@@ -674,18 +668,10 @@ def compute_curve_vae_loss(
     )
     topo_weight = topo_weight * mask.float()
 
-    if hasattr(config, "USE_FOCAL_LOSS") and config.USE_FOCAL_LOSS:
-        closed_loss = focal_loss(
-            pred["closed_logits"],
-            target["is_closed"],
-            getattr(config, "FOCAL_ALPHA", 0.25),
-            getattr(config, "FOCAL_GAMMA", 2.0),
-        )
-    else:
-        closed_loss = F.binary_cross_entropy_with_logits(
-            pred["closed_logits"], target["is_closed"].float(), reduction="none"
-        )
-        closed_loss = (closed_loss * topo_weight).sum() / mask.sum().clamp(min=1)
+    closed_loss = F.binary_cross_entropy_with_logits(
+        pred["closed_logits"], target["is_closed"].float(), reduction="none"
+    )
+    closed_loss = (closed_loss * topo_weight).sum() / mask.sum().clamp(min=1)
 
     losses["closed"] = closed_loss
 
@@ -713,7 +699,6 @@ def compute_curve_vae_loss(
     losses["total"] = total_loss
 
     return losses
-
 
 def process_batch_data(data_item, config, device):
     """Process batch data from dataloader - 优化版本"""
@@ -828,12 +813,10 @@ class LossAccumulator:
         for key, val in loss_dict.items():
             if key not in self.losses:
                 self.losses[key] = []
-            # 保持在GPU上
             self.losses[key].append(val.detach())
         self.count += 1
     
     def get_averages(self):
-        """批量转CPU计算平均值"""
         if self.count == 0:
             return {}
         averages = {}
@@ -890,7 +873,6 @@ def compute_patch_metrics(pred, target, mask):
 
     return metrics
 
-
 def compute_curve_metrics(pred, target, mask):
     """Compute curve evaluation metrics"""
     metrics = {}
@@ -940,7 +922,6 @@ def compute_curve_metrics(pred, target, mask):
     metrics["end_point_error"] = end_point_error.item()
 
     return metrics
-
 
 def train_pipeline(rank, num_gpus, args, config):
     dist.init_process_group(
@@ -1124,13 +1105,19 @@ def train_pipeline(rank, num_gpus, args, config):
 
     # Training loop
     best_val_loss = float("inf")
-    cur_epochs = start_epoch 
+    cur_epochs = start_epoch
+    global_step = start_epoch * len(train_data)
 
     for epoch in range(start_epoch, args.max_training_iterations):
-        current_kl_weight = kl_scheduler.get_weight(epoch)
+        # 延迟KL策略：前10000步不用KL
+        if global_step < 10000:
+            current_kl_weight = 0.0
+        else:
+            epoch_for_scheduler = (global_step - 10000) // len(train_data)
+            current_kl_weight = kl_scheduler.get_weight(epoch_for_scheduler)
 
-        if rank == 0:
-            logger.info(f"Epoch {epoch+1}/{args.max_training_iterations} - KL Weight: {current_kl_weight:.4f}")
+        if rank == 0 and epoch % 10 == 0:
+            logger.info(f"Epoch {epoch+1}/{args.max_training_iterations} - KL Weight: {current_kl_weight:.6f}")
 
         if distribute_sampler is not None:
             distribute_sampler.set_epoch(cur_epochs)
@@ -1140,7 +1127,6 @@ def train_pipeline(rank, num_gpus, args, config):
         curve_encoder.train()
         curve_decoder.train()
 
-        # Use loss accumulators to avoid frequent CPU sync
         patch_loss_acc = LossAccumulator()
         curve_loss_acc = LossAccumulator()
 
@@ -1184,11 +1170,11 @@ def train_pipeline(rank, num_gpus, args, config):
                     pred_patch = patch_decoder(z_p)
 
                     target_patch = {
-                        "points": processed_patches["patch_points"], #[B N 400 3]
-                        "normals": processed_patches["patch_normals"], #[B N 400 3]
-                        "u_closed": processed_patches["u_closed"],  #[B N]
-                        "v_closed": processed_patches["v_closed"], #[B N]
-                        "labels": processed_patches["labels"], #[B N]
+                        "points": processed_patches["patch_points"],
+                        "normals": processed_patches["patch_normals"],
+                        "u_closed": processed_patches["u_closed"],
+                        "v_closed": processed_patches["v_closed"],
+                        "labels": processed_patches["labels"],
                     }
 
                     patch_losses = compute_patch_vae_loss(
@@ -1287,21 +1273,24 @@ def train_pipeline(rank, num_gpus, args, config):
 
                 curve_loss_acc.add(curve_losses)
 
-            # Update progress bar less frequently
+            global_step += 1
+
             if rank == 0 and (batch_idx + 1) % config.LOG_INTERVAL == 0:
                 patch_avgs = patch_loss_acc.get_averages()
                 curve_avgs = curve_loss_acc.get_averages()
                 postfix = {}
                 if "total" in patch_avgs:
-                    postfix["P_loss"] = f"{patch_avgs['total']:.4f}"
+                    postfix["P_tot"] = f"{patch_avgs['total']:.3f}"
+                    postfix["P_rec"] = f"{patch_avgs.get('recon_points', 0):.3f}"
                 if "total" in curve_avgs:
-                    postfix["C_loss"] = f"{curve_avgs['total']:.4f}"
+                    postfix["C_tot"] = f"{curve_avgs['total']:.3f}"
+                    postfix["C_rec"] = f"{curve_avgs.get('recon_points', 0):.3f}"
                 if postfix and isinstance(pbar, tqdm):
                     pbar.set_postfix(postfix)
 
         cur_epochs += 1
 
-        # Compute epoch averages (single CPU sync per epoch)
+        # epoch级别的wandb logging（参考第四份代码的8个图）
         avg_patch_losses = patch_loss_acc.get_averages()
         avg_curve_losses = curve_loss_acc.get_averages()
 
@@ -1325,7 +1314,8 @@ def train_pipeline(rank, num_gpus, args, config):
             
             wandb.log(log_dict)
             
-            logger.info(f"Epoch {epoch+1} - Train Patch Loss: {avg_patch_losses.get('total', 0):.4f}, Train Curve Loss: {avg_curve_losses.get('total', 0):.4f}")
+            if epoch % 10 == 0:
+                logger.info(f"Epoch {epoch+1} - Patch: {avg_patch_losses.get('total', 0):.4f}, Curve: {avg_curve_losses.get('total', 0):.4f}")
 
         # Validation
         if (epoch + 1) % config.EVAL_INTERVAL == 0:
@@ -1402,7 +1392,6 @@ def train_pipeline(rank, num_gpus, args, config):
             )
             logger.info(f"Saved checkpoint for epoch {epoch+1}")
 
-    # 训练结束后的中文损失解释
     if rank == 0:
         print("\n" + "="*80)
         print("训练完成！各项损失含义解释：")
@@ -1425,7 +1414,6 @@ def train_pipeline(rank, num_gpus, args, config):
         
         wandb.finish()
 
-
 def val_pipeline(
     patch_encoder,
     patch_decoder,
@@ -1447,8 +1435,8 @@ def val_pipeline(
     curve_encoder.eval()
     curve_decoder.eval()
 
-    patch_metrics_all = []
-    curve_metrics_all = []
+    patch_recon_errors = []
+    curve_recon_errors = []
 
     with torch.no_grad():
         pbar = tqdm(val_dataloader, desc="Validation", leave=False, dynamic_ncols=True) if rank == 0 else val_dataloader
@@ -1469,18 +1457,13 @@ def val_pipeline(
 
                 pred_patch = patch_decoder(mean_p)
 
-                target_patch = {
-                    "points": processed_patches["patch_points"],
-                    "normals": processed_patches["patch_normals"],
-                    "u_closed": processed_patches["u_closed"],
-                    "v_closed": processed_patches["v_closed"],
-                    "labels": processed_patches["labels"],
-                }
-
-                patch_metrics = compute_patch_metrics(
-                    pred_patch, target_patch, processed_patches["mask"]
+                recon_error = F.mse_loss(
+                    pred_patch["points"], 
+                    processed_patches["patch_points"], 
+                    reduction="none"
                 )
-                patch_metrics_all.append(patch_metrics)
+                recon_error = (recon_error * processed_patches["mask"].unsqueeze(-1).unsqueeze(-1)).sum() / processed_patches["mask"].sum().clamp(min=1)
+                patch_recon_errors.append(recon_error)
 
             if processed_curves is not None:
                 mean_c, _ = curve_encoder(
@@ -1493,35 +1476,27 @@ def val_pipeline(
 
                 pred_curve = curve_decoder(mean_c)
 
-                target_curve = {
-                    "points": processed_curves["curve_points"],
-                    "endpoints": processed_curves["endpoints"],
-                    "is_closed": processed_curves["is_closed"],
-                    "labels": processed_curves["labels"],
-                }
-
-                curve_metrics = compute_curve_metrics(
-                    pred_curve, target_curve, processed_curves["mask"]
+                recon_error = F.mse_loss(
+                    pred_curve["points"], 
+                    processed_curves["curve_points"], 
+                    reduction="none"
                 )
-                curve_metrics_all.append(curve_metrics)
+                recon_error = (recon_error * processed_curves["mask"].unsqueeze(-1).unsqueeze(-1)).sum() / processed_curves["mask"].sum().clamp(min=1)
+                curve_recon_errors.append(recon_error)
 
     val_metrics = {}
 
-    if patch_metrics_all:
-        avg_patch_metrics = {}
-        for key in patch_metrics_all[0].keys():
-            avg_patch_metrics[key] = sum(m[key] for m in patch_metrics_all) / len(
-                patch_metrics_all
-            )
-        val_metrics["patch"] = avg_patch_metrics
+    if patch_recon_errors:
+        patch_errors_tensor = torch.stack(patch_recon_errors)
+        val_metrics["patch"] = {
+            "recon_error": patch_errors_tensor.mean().item()
+        }
 
-    if curve_metrics_all:
-        avg_curve_metrics = {}
-        for key in curve_metrics_all[0].keys():
-            avg_curve_metrics[key] = sum(m[key] for m in curve_metrics_all) / len(
-                curve_metrics_all
-            )
-        val_metrics["curve"] = avg_curve_metrics
+    if curve_recon_errors:
+        curve_errors_tensor = torch.stack(curve_recon_errors)
+        val_metrics["curve"] = {
+            "recon_error": curve_errors_tensor.mean().item()
+        }
 
     patch_encoder.train()
     patch_decoder.train()
@@ -1529,7 +1504,6 @@ def val_pipeline(
     curve_decoder.train()
 
     return val_metrics
-
 
 def eval_pipeline(args, config):
     """Complete evaluation pipeline"""
