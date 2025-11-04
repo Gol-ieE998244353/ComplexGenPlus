@@ -5,7 +5,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
-from typing import Tuple, Optional, Dict
 import math
 from tqdm import tqdm
 import torch.multiprocessing as mp
@@ -16,95 +15,267 @@ from datetime import datetime
 import wandb
 from torch.cuda.amp import autocast, GradScaler
 
-from Minkowski_backbone import (
-    get_args_parser,
-    voxel_dim,
-    points_per_curve,
-    points_per_patch_dim,
-    num_of_gpus,
-    MLP,
-    MLP_hn,
-)
 from data_loader_abc import *
 
 class Config:
-    # Model Architecture
     D_MODEL = 384 
     NHEAD = 8
     NUM_LAYERS = 6
     DIM_FEEDFORWARD = 1024
     DROPOUT = 0.05
 
-    # Latent Space
     CURVE_LATENT_DIM = 256
     PATCH_LATENT_DIM = 256
 
-    # Data
     PATCH_NUM_POINTS = 400
-    POINTS_PER_PATCH_DIM = 20
     MAX_CURVES = 100
     MAX_PATCHES = 50 
     
-    # HyperNetwork
     HN_PE_DIM = 64
     HN_MLP_DIM = 128
 
-    # Position Encoding
     PE_TEMPERATURE = 10000
     PE_SCALE = 2 * math.pi
 
-    # Labels
     CURVE_NUM_CLASSES = 4
     PATCH_NUM_CLASSES = 6
 
-    # VAE - 关键修改
     KL_WEIGHT_START = 0.0
-    KL_WEIGHT_END = 0.0001  # 从0.1改为0.0001
-    KL_WARMUP_EPOCHS = 100  # 从20改为100
-    KL_FREE_BITS = 0.5  # Free bits per dimension
+    KL_WEIGHT_END = 0.0001  
+    KL_WARMUP_EPOCHS = 100  
+    KL_FREE_BITS = 0.5  
 
-    # Training Optimization
     LEARNING_RATE = 1e-3
     WEIGHT_DECAY = 1e-5
     GRAD_CLIP_NORM = 1.0
     EVAL_INTERVAL = 10  
     SAVE_INTERVAL = 50
     
-    # Performance Optimization
     USE_AMP = False
     GRADIENT_ACCUMULATION_STEPS = 2
     LOG_INTERVAL = 200
 
-    # Loss weights
     RECON_WEIGHT = 1.0
     ENDPOINT_WEIGHT = 1.0
     TOPOLOGY_WEIGHT = 0.5
     LABEL_WEIGHT = 0.5
     VALIDITY_WEIGHT = 0.1
 
-    # Experimental options
     USE_TRANSFORMER = False  
     USE_FOCAL_LOSS = False
     FOCAL_ALPHA = 0.25
     FOCAL_GAMMA = 2.0
 
-def setup_logger(log_dir, rank=0):
-    """Setup file logger"""
-    if rank != 0:
-        return None
-    
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f'training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
-    
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-        ]
-    )
-    return logging.getLogger(__name__)
+class MLP(nn.Module):
+    """ Very simple multi-layer perceptron (also called FFN)"""
 
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, sin=False):
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+        self.sin_activation = sin
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            if(self.sin_activation):
+              x = layer(x).sin() if i < self.num_layers - 1 else layer(x)
+            else:
+              x = F.leaky_relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+        return x
+
+flag_hidden_layer = True
+hn_hidden_dim = 128
+hn_pe_dim = 64
+
+class MLP_hn(nn.Module): #hypernets of MLP
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, input_dim_fea):
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        h_plus = [hidden_dim + 1] * (num_layers - 1)
+        self.layers_dims = list(zip([input_dim + 1] + h_plus, h + [output_dim]))
+        self.layers_size = [a * b for a,b in self.layers_dims]
+        #ori version
+        if not flag_hidden_layer:
+            self.layer = nn.Linear(input_dim_fea, sum(self.layers_size))
+        else:
+            self.layer1 = nn.Linear(input_dim_fea, hn_hidden_dim)
+            self.layer2 = nn.Linear(hn_hidden_dim, sum(self.layers_size))
+        
+    def forward(self, x, feature):
+      #ori version
+      if not flag_hidden_layer:
+        net_par = self.layer(feature)
+      #new version
+      else:
+        net_par = self.layer1(feature)
+        net_par = F.relu(net_par)
+        net_par = self.layer2(net_par)
+      net_par = net_par / math.sqrt(hn_pe_dim)
+
+      net_par_layers = torch.split(net_par, self.layers_size, dim=-1)
+      for i in range(len(self.layers_size)):
+        layer_par = net_par_layers[i].view(net_par.shape[0], net_par.shape[1], net_par.shape[2] ,self.layers_dims[i][0], self.layers_dims[i][1])
+        x = torch.einsum('...ij,...jk->...ik', x, layer_par[...,:-1,:]) + layer_par[...,-1:,:]
+        if i < self.num_layers - 1:
+          x = F.leaky_relu(x)
+      return x
+
+def get_args_parser():
+    parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
+    parser.add_argument('--no_output', action='store_true', help = 'not output for evaluation')
+    parser.add_argument('--reuseid', action='store_true', help = 'reuse id for distance computation')
+    parser.add_argument('--ori_mlp', action='store_true', help = 'use original version of MLPs')
+    parser.add_argument('--ckpt_interval', default=3000, type=int)
+    parser.add_argument('--dist_th', default=0.1, type=float)
+    parser.add_argument('--dist_th_tg', default=0.1, type=float)
+    parser.add_argument('--val_th', default=0.5, type=float)
+    parser.add_argument('--flag_cycleid', action = 'store_true', help = 'cycle id')
+    parser.add_argument('--parsenet', action = 'store_true', help = 'use parsenet data')
+    parser.add_argument('--ourresnet', action = 'store_true', help = 'use our resnet')
+    parser.add_argument('--backbone_bn', action = 'store_true', help = 'use backbone with batch-norm')
+    parser.add_argument('--m', default=64, type=int, help = 'set m value')
+    parser.add_argument('--hidden_dim_mlp', default=384, type=int, help = 'hidden dimension of MLP for ablation study')
+    #for hn
+    parser.add_argument('--hn_scale', action = 'store_true', help = 'original topo embed')
+    parser.add_argument('--no_tripath', action = 'store_true', help = 'no tripath, for ablation')
+    parser.add_argument('--no_topo', action = 'store_true', help = 'no topo, for ablation, please also set no_tripath as true')
+    parser.add_argument('--pe_sin', action = 'store_true', help = 'sin positional embedding')
+    parser.add_argument('--pe_sin_base', default=1.2, type=float)
+    parser.add_argument('--no_pe', action = 'store_true', help = 'not using positional encoding')
+    parser.add_argument('--spe', action = 'store_true', help = 'simple positional encoding')
+    parser.add_argument('--patch_normal', action = 'store_true', help = 'add tangent normal constraints for patch')
+    parser.add_argument('--patch_lap', action = 'store_true', help = 'add laplacian constraints for patch')
+    parser.add_argument('--patch_lapboundary', action = 'store_true', help = 'add boundary laplacian constraints for patch')
+    parser.add_argument('--data_medium', action = 'store_true', help = 'add boundary laplacian constraints for patch')
+    parser.add_argument('--vis_train', action = 'store_true', help = 'visualize training data')
+    parser.add_argument('--vis_test', action = 'store_true', help = 'visualize test data')
+    parser.add_argument('--eval_train', action = 'store_true', help = 'evaluate training data')
+    parser.add_argument('--geom_l2', action = 'store_true', help = 'use l2 norm for geometric terms')
+    parser.add_argument('--patch_grid', action = 'store_true', help = 'using patch grid')
+    parser.add_argument('--patch_close', action = 'store_true', help = 'predict patch closeness')
+    parser.add_argument('--batch_cd', action = 'store_true', help = 'compute chamfer distance in batch')
+    parser.add_argument('--patch_emd', action = 'store_true', help = 'using emd for patch loss computing')
+    parser.add_argument('--patch_uv', action = 'store_true', help = 'compute patch uv, and patch emd is computed based on patch uv')
+    parser.add_argument('--curve_open_loss', action = 'store_true', help = 'treat open curve seperately')
+    parser.add_argument('--backbone_expand', action = 'store_true', help = 'expand backbone coordinates and kernel size of the first convolution')
+    parser.add_argument('--output_normal', action = 'store_true', help = 'output normal for prediction')
+    parser.add_argument('--output_normal_diff_coef', default=1, type=float, help="loss coefficient for output normal diff loss")
+    parser.add_argument('--output_normal_tangent_coef', default=1, type=float, help="loss coefficient for output normal tangent lonss")
+    parser.add_argument('--enable_automatic_restore', action='store_true', help = 'find ckpt automatically when training is interrupted')
+    parser.add_argument('--quicktest', action='store_true', help = 'only test on 10 models, no validation is used')
+    parser.add_argument('--noise', default=0, type=int, help = 'add noise, 0:no, 1: 0.01, 2: 0.02, 3: 0.05')
+    parser.add_argument('--noisetest', default=0, type=int, help = 'add noise for testing, 0:no, 1: 0.01, 2: 0.02, 3: 0.05')
+    parser.add_argument('--partial', action='store_true', help = 'use partial data')
+    parser.add_argument('--experiment_name', type=str, required = True)
+    parser.add_argument('--lr', default=1e-4, type=float)
+    parser.add_argument('--lr_drop', default=5000, type=int)
+    parser.add_argument('--batch_size', default=1, type=int)
+    parser.add_argument('--points_per_patch_dim', default=20, type=int)
+    parser.add_argument('--eval_res_cov', action='store_true', help="evaluate residual loss and coverage")
+    parser.add_argument('--eval_matched', action='store_true', help="evaluate residual loss and coverage", default=True)
+    parser.add_argument('--eval_selftopo', action='store_true', help="evaluate self topo consistency")
+    parser.add_argument('--th_res', default=0.05, type=float, help="threshold for evaluating residual")
+    parser.add_argument('--eval_param', action='store_true', help="evaluate residual and converage by parameters")
+    parser.add_argument('--evalrest', action='store_true', help="evaluate rest data of 900 models")
+    parser.add_argument('--part', default=-1, type=int) #0,1,2,3, divide data into 4 groups
+    parser.add_argument('--regen', action='store_true', help="regen files")
+    parser.add_argument('--th_cov', default=0.01, type=float)
+    parser.add_argument('--rotation_augment', action='store_true', help="enable rotation augmentation")
+    parser.add_argument('--num_angles', type=int)
+    parser.add_argument('--random_angle', action='store_true', help="enable rotation augmentation with random angle")
+    parser.add_argument('--input_voxel_dim', default=128, type=int, help="voxel dimension of input")
+    parser.add_argument('--eval', action='store_true')
+    parser.add_argument('--evalfinal', action='store_true')
+    parser.add_argument('--evaltopo', action='store_true')
+    parser.add_argument('--fittingonce', action='store_true')
+    parser.add_argument('--dropout', default=0.0, type=float,
+                        help="Dropout applied in the transformer")
+    parser.add_argument('--nheads', default=8, type=int,
+                        help="Number of attention heads inside the transformer's attentions")
+    parser.add_argument('--num_corner_queries', default=100, type=int,help="Number of corner query slots")
+    parser.add_argument('--num_curve_queries', default=150, type=int,help="Number of curve query slots")
+    parser.add_argument('--num_patch_queries', default=100, type=int,help="Number of patch query slots")
+    parser.add_argument('--pre_norm', action='store_false') #true
+    parser.add_argument('--position_embedding', default='sine', type=str, choices=('sine', 'learned'),
+                        help="Type of positional embedding to use on top of the image features")
+    
+    # * BackBone unused
+    parser.add_argument('--backbone_feature_encode', action='store_true',
+                        help="Using sin to encode features in backbone")
+    
+    # * Transformer
+    parser.add_argument('--enc_layers', default=6, type=int,
+                        help="Number of encoding layers in the transformer")
+    parser.add_argument('--dec_layers', default=6, type=int,
+                        help="Number of decoding layers in the transformer")
+    parser.add_argument('--dim_feedforward', default=2048, type=int,
+                        help="Intermediate size of the feedforward layers in the transformer blocks")
+    parser.add_argument('--local_attention', dest='using_local_attention',action='store_true',
+                        help="Using local attention in transformer")
+    parser.add_argument("--topo_embed_dim", default=256, type=int, help="Feature Dimension Size For Topology Matching")
+    parser.add_argument("--normalize_embed_feature", action="store_true", help="Normalize Topo Feature before Matching")
+    parser.add_argument("--num_heads_dot", default=1, type=int, help="number of heads to compute similarity")
+    parser.add_argument("--matrix_eigen_similarity", action="store_true", help="Using Matrix Eigen Similarity")
+    # * Loss coefficients
+    parser.add_argument('--class_loss_coef', default=1, type=float)
+    parser.add_argument('--corner_geometry_loss_coef', default=1000, type=float, help="loss coefficient for geometric loss in corner matching and training")
+    parser.add_argument('--curve_geometry_loss_coef', default=1000, type=float, help="loss coefficient for geometric loss in curve matching and training")
+    parser.add_argument('--patch_geometry_loss_coef', default=1000, type=float, help="loss coefficient for geometric loss in patch matching and training")
+    parser.add_argument('--corner_avg_count', default=20.25, type=float, help="avg corner count for parsenet dataset")
+    parser.add_argument('--curve_avg_count', default=37.39, type=float, help="avg curve count for parsenet dataset")
+    parser.add_argument('--patch_avg_count', default=18.17, type=float, help="avg patch count for parsenet dataset")
+    parser.add_argument('--global_invalid_weight', default=1.0, type=float, help="avg patch count for parsenet dataset")
+    parser.add_argument('--curve_corner_topo_loss_coef', default=1, type=float)
+    parser.add_argument('--patch_curve_topo_loss_coef', default=1, type=float)
+    parser.add_argument('--patch_corner_topo_loss_coef', default=1, type=float)
+    parser.add_argument('--topo_loss_coef', default=1, type=float)
+    parser.add_argument('--curve_corner_geom_loss_coef', default=0, type=float)
+    parser.add_argument('--topo_acc', action='store_true',help="compute and show topo_acc")
+    parser.add_argument('--no_show_topo', action='store_true',help="not show three topo loss: curve_point, curve_patch, patch_close")
+    parser.add_argument('--patch_normal_loss_coef', default=1, type=float, help="loss coefficient for patch normal loss")
+    parser.add_argument('--patch_lap_loss_coef', default=1000, type=float, help="loss coefficient for patch normal loss")
+    parser.add_argument('--weight_decay', default=1e-4, type=float)
+    
+    #transformer feature embedding
+    parser.add_argument("--curve_embedding_mlp_layers", default=3, type=int)
+    # training
+    parser.add_argument('--gpu', default="0,1,2", type=str,
+                        help="gpu id to be used")
+    parser.add_argument("--checkpoint_path", default=None, type=str, help="checkpoint file (if have) to be used")
+    parser.add_argument("--input_feature_type", default='global', type=str, help="input feature type(supported type: local global occupancy)")
+    parser.add_argument("--input_normal_signals", action='store_true', help='input normal signals in voxel features')
+    parser.add_argument('--max_training_iterations', default=250001, type=int)
+    parser.add_argument('--skip_transformer_encoder', action='store_false', help = 'remove encoder part of transformer')
+    parser.add_argument('--clip_max_norm', default=0.0, type=float,
+                       help='gradient clipping max norm')    
+
+    parser.add_argument('--clip_value', action='store_true', help = 'clip value')
+    parser.add_argument('--single_dir_patch_chamfer', action='store_true', help = 'Single direction chamfer loss in patch processing')
+    parser.add_argument('--extra_single_chamfer', action='store_true', help = 'based on emd, add extra single chamfer distance from gt patch to predicted grid')
+    parser.add_argument('--extra_single_chamfer_weight', default=300.0, type=float)
+    parser.add_argument("--save_gt", action='store_true', help = 'save gt info in predicted pickle file')
+    parser.add_argument("--no_instance_norm", action='store_true', help = 'using instance normalization in mink backbone')
+    parser.add_argument("--sin", action='store_true', help = 'using sin activation in geometry mlp')
+    parser.add_argument("--suffix", default='_opt_mix_final.json', type=str, help="suffix for evaluation")
+    parser.add_argument("--folder", default=None, type=str, help="inter folder for evaluation")
+    parser.add_argument("--vis_inter_layer", default=-1, type=int)
+    # * Matcher
+    parser.add_argument("--using_prob_in_matching", action='store_true', help = 'using -p in matching cost')
+
+
+    '''
+    parser.add_argument('--set_cost_class', default=1, type=float,
+                        help="Class coefficient in the matching cost")
+    parser.add_argument('--set_cost_bbox', default=5, type=float,
+                        help="L1 box coefficient in the matching cost")
+    parser.add_argument('--set_cost_giou', default=2, type=float,
+                        help="giou box coefficient in the matching cost")
+    '''
+    return parser
+
+points_per_curve = 34
 
 class PositionEmbeddingSine3D(nn.Module):
     def __init__(self, num_pos_feats=64, temperature=10000, normalize=True, scale=None):
@@ -253,7 +424,7 @@ class CurveEncoder(nn.Module):
 
         if self.config.USE_TRANSFORMER:
             centroids = curve_points.mean(dim=2)
-            pos_enc = self.pos_encoder(centroids, voxel_dim=voxel_dim)
+            pos_enc = self.pos_encoder(centroids, voxel_dim=128)
             tokens = tokens + pos_enc
 
             attn_mask = ~mask if mask is not None else None
@@ -402,7 +573,7 @@ class PatchEncoder(nn.Module):
 
         if self.config.USE_TRANSFORMER:
             centroids = patch_points.mean(dim=2)
-            pos_enc = self.pos_encoder(centroids, voxel_dim=voxel_dim)
+            pos_enc = self.pos_encoder(centroids, voxel_dim=128)
             tokens = tokens + pos_enc
 
             attn_mask = ~mask if mask is not None else None
@@ -504,6 +675,23 @@ class PatchDecoder(nn.Module):
             "label_logits": label_logits,
             "validity_logits": validity_logits,
         }
+        
+def setup_logger(log_dir, rank=0):
+    """Setup file logger"""
+    if rank != 0:
+        return None
+    
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f'training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+        ]
+    )
+    return logging.getLogger(__name__)
 
 class KLScheduler:
     def __init__(self, start_weight=0.0, end_weight=0.0001, warmup_epochs=100):
@@ -701,7 +889,6 @@ def compute_curve_vae_loss(
     return losses
 
 def process_batch_data(data_item, config, device):
-    """Process batch data from dataloader - 优化版本"""
     corner_points = data_item[0]
     corner_batch_idx = data_item[1]
     batch_sample_id = data_item[2]
@@ -717,7 +904,6 @@ def process_batch_data(data_item, config, device):
         max_n_curves = max([c["curve_points"].shape[0] for c in target_curves_list])
         max_n_curves = min(max_n_curves, config.MAX_CURVES)
 
-        # 直接在GPU上创建张量
         curve_points_batch = torch.zeros(batch_size, max_n_curves, 34, 3, device=device, dtype=torch.float32)
         endpoints_batch = torch.zeros(batch_size, max_n_curves, 2, 3, device=device, dtype=torch.float32)
         is_closed_batch = torch.zeros(batch_size, max_n_curves, dtype=torch.bool, device=device)
@@ -804,7 +990,6 @@ def process_batch_data(data_item, config, device):
     return processed_curves, processed_patches
 
 class LossAccumulator:
-    """优化版本 - 减少CPU-GPU同步"""
     def __init__(self):
         self.losses = {}
         self.count = 0
@@ -967,7 +1152,7 @@ def train_pipeline(rank, num_gpus, args, config):
     if args.quicktest:
         train_data, distribute_sampler = train_data_loader(
             args.batch_size,
-            voxel_dim=voxel_dim,
+            voxel_dim=args.input_voxel_dim,
             data_folder="data/train_small",
             feature_type=args.input_feature_type,
             pad1s=not args.backbone_feature_encode,
@@ -979,12 +1164,12 @@ def train_pipeline(rank, num_gpus, args, config):
             flag_grid=args.patch_grid,
             num_angle=args.num_angles,
             flag_patch_uv=args.patch_uv,
-            dim_grid=points_per_patch_dim,
+            dim_grid=args.points_per_patch_dim,
             eval_res_cov=args.extra_single_chamfer,
         )
         val_data, val_data_sampler = train_data_loader(
             args.batch_size,
-            voxel_dim=voxel_dim,
+            voxel_dim=args.input_voxel_dim,
             data_folder="data/train_small",
             feature_type=args.input_feature_type,
             pad1s=not args.backbone_feature_encode,
@@ -995,7 +1180,7 @@ def train_pipeline(rank, num_gpus, args, config):
             flag_grid=args.patch_grid,
             num_angle=args.num_angles,
             flag_patch_uv=args.patch_uv,
-            dim_grid=points_per_patch_dim,
+            dim_grid=args.points_per_patch_dim,
             eval_res_cov=args.extra_single_chamfer,
         )
     else:
@@ -1005,7 +1190,7 @@ def train_pipeline(rank, num_gpus, args, config):
             )
             train_data, distribute_sampler = train_data_loader(
                 args.batch_size,
-                voxel_dim=voxel_dim,
+                voxel_dim=args.input_voxel_dim,
                 data_folder=train_folder,
                 feature_type=args.input_feature_type,
                 pad1s=not args.backbone_feature_encode,
@@ -1017,7 +1202,7 @@ def train_pipeline(rank, num_gpus, args, config):
                 flag_grid=args.patch_grid,
                 num_angle=args.num_angles,
                 flag_patch_uv=args.patch_uv,
-                dim_grid=points_per_patch_dim,
+                dim_grid=args.points_per_patch_dim,
                 eval_res_cov=args.extra_single_chamfer,
             )
 
@@ -1028,7 +1213,7 @@ def train_pipeline(rank, num_gpus, args, config):
 
         val_data, val_data_sampler = train_data_loader(
             args.batch_size,
-            voxel_dim=voxel_dim,
+            voxel_dim=args.input_voxel_dim,
             data_folder=val_folder,
             feature_type=args.input_feature_type,
             pad1s=not args.backbone_feature_encode,
@@ -1039,7 +1224,7 @@ def train_pipeline(rank, num_gpus, args, config):
             flag_grid=args.patch_grid,
             num_angle=args.num_angles,
             flag_patch_uv=args.patch_uv,
-            dim_grid=points_per_patch_dim,
+            dim_grid=args.points_per_patch_dim,
             eval_res_cov=args.extra_single_chamfer,
         )
 
@@ -1105,19 +1290,13 @@ def train_pipeline(rank, num_gpus, args, config):
 
     # Training loop
     best_val_loss = float("inf")
-    cur_epochs = start_epoch
-    global_step = start_epoch * len(train_data)
+    cur_epochs = start_epoch 
 
     for epoch in range(start_epoch, args.max_training_iterations):
-        # 延迟KL策略：前10000步不用KL
-        if global_step < 10000:
-            current_kl_weight = 0.0
-        else:
-            epoch_for_scheduler = (global_step - 10000) // len(train_data)
-            current_kl_weight = kl_scheduler.get_weight(epoch_for_scheduler)
+        current_kl_weight = kl_scheduler.get_weight(epoch)
 
-        if rank == 0 and epoch % 10 == 0:
-            logger.info(f"Epoch {epoch+1}/{args.max_training_iterations} - KL Weight: {current_kl_weight:.6f}")
+        if rank == 0:
+            logger.info(f"Epoch {epoch+1}/{args.max_training_iterations} - KL Weight: {current_kl_weight:.4f}")
 
         if distribute_sampler is not None:
             distribute_sampler.set_epoch(cur_epochs)
@@ -1127,6 +1306,7 @@ def train_pipeline(rank, num_gpus, args, config):
         curve_encoder.train()
         curve_decoder.train()
 
+        # Use loss accumulators to avoid frequent CPU sync
         patch_loss_acc = LossAccumulator()
         curve_loss_acc = LossAccumulator()
 
@@ -1170,11 +1350,11 @@ def train_pipeline(rank, num_gpus, args, config):
                     pred_patch = patch_decoder(z_p)
 
                     target_patch = {
-                        "points": processed_patches["patch_points"],
-                        "normals": processed_patches["patch_normals"],
-                        "u_closed": processed_patches["u_closed"],
-                        "v_closed": processed_patches["v_closed"],
-                        "labels": processed_patches["labels"],
+                        "points": processed_patches["patch_points"], #[B N 400 3]
+                        "normals": processed_patches["patch_normals"], #[B N 400 3]
+                        "u_closed": processed_patches["u_closed"],  #[B N]
+                        "v_closed": processed_patches["v_closed"], #[B N]
+                        "labels": processed_patches["labels"], #[B N]
                     }
 
                     patch_losses = compute_patch_vae_loss(
@@ -1273,24 +1453,21 @@ def train_pipeline(rank, num_gpus, args, config):
 
                 curve_loss_acc.add(curve_losses)
 
-            global_step += 1
-
+            # Update progress bar less frequently
             if rank == 0 and (batch_idx + 1) % config.LOG_INTERVAL == 0:
                 patch_avgs = patch_loss_acc.get_averages()
                 curve_avgs = curve_loss_acc.get_averages()
                 postfix = {}
                 if "total" in patch_avgs:
-                    postfix["P_tot"] = f"{patch_avgs['total']:.3f}"
-                    postfix["P_rec"] = f"{patch_avgs.get('recon_points', 0):.3f}"
+                    postfix["P_loss"] = f"{patch_avgs['total']:.4f}"
                 if "total" in curve_avgs:
-                    postfix["C_tot"] = f"{curve_avgs['total']:.3f}"
-                    postfix["C_rec"] = f"{curve_avgs.get('recon_points', 0):.3f}"
+                    postfix["C_loss"] = f"{curve_avgs['total']:.4f}"
                 if postfix and isinstance(pbar, tqdm):
                     pbar.set_postfix(postfix)
 
         cur_epochs += 1
 
-        # epoch级别的wandb logging（参考第四份代码的8个图）
+        # Compute epoch averages (single CPU sync per epoch)
         avg_patch_losses = patch_loss_acc.get_averages()
         avg_curve_losses = curve_loss_acc.get_averages()
 
@@ -1314,8 +1491,7 @@ def train_pipeline(rank, num_gpus, args, config):
             
             wandb.log(log_dict)
             
-            if epoch % 10 == 0:
-                logger.info(f"Epoch {epoch+1} - Patch: {avg_patch_losses.get('total', 0):.4f}, Curve: {avg_curve_losses.get('total', 0):.4f}")
+            logger.info(f"Epoch {epoch+1} - Train Patch Loss: {avg_patch_losses.get('total', 0):.4f}, Train Curve Loss: {avg_curve_losses.get('total', 0):.4f}")
 
         # Validation
         if (epoch + 1) % config.EVAL_INTERVAL == 0:
@@ -1393,25 +1569,6 @@ def train_pipeline(rank, num_gpus, args, config):
             logger.info(f"Saved checkpoint for epoch {epoch+1}")
 
     if rank == 0:
-        print("\n" + "="*80)
-        print("训练完成！各项损失含义解释：")
-        print("="*80)
-        print("【Patch 面片损失】:")
-        print("  • total: 总损失 - 所有损失项的加权和，用于反向传播优化")
-        print("  • kl: KL散度损失 - 确保编码后的潜在向量符合标准正态分布，实现正则化")
-        print("  • recon_points: 点重建损失 - 衡量重建的3D点坐标与真实坐标的差异")
-        print("  • topology: 拓扑损失 - 预测面片在U/V方向是否闭合的分类准确性")
-        print()
-        print("【Curve 曲线损失】:")
-        print("  • total: 总损失 - 所有损失项的加权和，用于反向传播优化")
-        print("  • kl: KL散度损失 - 确保编码后的潜在向量符合标准正态分布，实现正则化")
-        print("  • recon_points: 点重建损失 - 衡量重建的3D曲线点坐标与真实坐标的差异")
-        print("  • topology: 拓扑损失 - 预测曲线是否为闭合曲线的分类准确性")
-        print()
-        print("【验证损失】:")
-        print("  • recon_error: 重建误差 - 在验证集上测量的几何重建精度，越小越好")
-        print("="*80)
-        
         wandb.finish()
 
 def val_pipeline(
@@ -1509,14 +1666,10 @@ def eval_pipeline(args, config):
     """Complete evaluation pipeline"""
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    points_per_patch_dim = (
-        config.POINTS_PER_PATCH_DIM if hasattr(config, "POINTS_PER_PATCH_DIM") else 32
-    )
-
     if args.quicktest:
         test_data, _ = train_data_loader(
             args.batch_size,
-            voxel_dim=voxel_dim,
+            voxel_dim=args.input_voxel_dim,
             data_folder="data/train_small",
             feature_type=args.input_feature_type,
             pad1s=not args.backbone_feature_encode,
@@ -1527,7 +1680,7 @@ def eval_pipeline(args, config):
             flag_grid=args.patch_grid,
             num_angle=args.num_angles,
             flag_patch_uv=args.patch_uv,
-            dim_grid=points_per_patch_dim,
+            dim_grid=args.points_per_patch_dim,
             eval_res_cov=args.extra_single_chamfer,
         )
     else:
@@ -1538,7 +1691,7 @@ def eval_pipeline(args, config):
 
         test_data, _ = train_data_loader(
             args.batch_size,
-            voxel_dim=voxel_dim,
+            voxel_dim=args.input_voxel_dim,
             data_folder=test_folder,
             feature_type=args.input_feature_type,
             pad1s=not args.backbone_feature_encode,
@@ -1549,7 +1702,7 @@ def eval_pipeline(args, config):
             flag_grid=args.patch_grid,
             num_angle=args.num_angles,
             flag_patch_uv=args.patch_uv,
-            dim_grid=points_per_patch_dim,
+            dim_grid=args.points_per_patch_dim,
             eval_res_cov=args.extra_single_chamfer,
         )
 
@@ -1691,18 +1844,18 @@ def eval_pipeline(args, config):
         print(f"\n结果已保存到: {results_path}")
 
     return test_metrics
+
+def parseargs(): 
+    parser = argparse.ArgumentParser( "Training and evaluation script", parents=[get_args_parser()] ) 
+    global points_per_patch_dim, voxel_dim, config, args 
+    args = parser.parse_args() 
+    config = Config() 
+
 if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(True)
-
-    parser = argparse.ArgumentParser(
-        "Training and evaluation script", parents=[get_args_parser()]
-    )
-    args = parser.parse_args()
-
     num_of_gpus = torch.cuda.device_count()
-
-    config = Config()
-
+    print("Available GPUs:", num_of_gpus)
+    parseargs()
     if args.eval:
         eval_pipeline(args, config)
     else:
