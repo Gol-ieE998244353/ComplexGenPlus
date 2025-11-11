@@ -1,360 +1,926 @@
-# visualize_worst.py (完整文件 - 支持单/多GPU推理)
 import argparse
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 import numpy as np
 import os
 from pathlib import Path
 from tqdm import tqdm
+import pickle
+import logging
+from datetime import datetime
 
-# ---- 你的模型/工具导入 ----
-from curve_patch_trainer import (
+from train_pc import (
     Config,
     PatchEncoder, PatchDecoder,
     CurveEncoder, CurveDecoder,
-    process_batch_data,
+    compute_patch_metrics,
+    compute_curve_metrics,
 )
-from data_loader_abc import train_data_loader
-import plywrite
+from data_loader_optimized import train_data_loader_clean  
 
-# （顶部不再依赖全局 voxel_dim）
 curve_type_list = np.array(['Circle', 'BSpline', 'Line', 'Ellipse'])
 patch_type_list = np.array(['Cylinder', 'Torus', 'BSpline', 'Plane', 'Cone', 'Sphere'])
-curve_colormap = {'Circle': np.array([255,0,0]), 'BSpline': np.array([255,255,0]), 'Line': np.array([0,255,0]), 'Ellipse': np.array([0,0,255])}
-patch_colormap = {'Plane': np.array([0,255,0]), 'Cylinder': np.array([255,0,0]),  'Torus': np.array([255,128,0]), 'BSpline': np.array([255,255,0]), 'Cone': np.array([255,102,255]), 'Sphere': np.array([0,0,255])}
 
+def setup_logger(output_dir, rank=0):
+    """设置日志记录器"""
+    if rank != 0:
+        return None
+    os.makedirs(output_dir, exist_ok=True)
+    log_file = os.path.join(output_dir, f'visualization_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
+
+def setup_distributed():
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend='nccl' if torch.cuda.is_available() else 'gloo',
+                init_method='env://'
+            )
+            if torch.cuda.is_available():
+                torch.cuda.set_device(local_rank)
+    else:
+        rank, world_size, local_rank = 0, 1, 0
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend='nccl' if torch.cuda.is_available() else 'gloo',
+                init_method='tcp://127.0.0.1:23456',
+                world_size=1,
+                rank=0
+            )
+            if torch.cuda.is_available():
+                torch.cuda.set_device(0)
+    return rank, world_size, local_rank
+
+def gen_cylinder_from_two_points(p1, p2, offset, radius=0.005, num_sides=8):
+    p1, p2 = np.array(p1), np.array(p2)
+    direction = p2 - p1
+    length = np.linalg.norm(direction)
+    if length < 1e-6:
+        return np.zeros((0, 3)), []
+    direction = direction / length
+    
+    up = np.array([0, 0, 1]) if abs(direction[2]) < 0.99 else np.array([1, 0, 0])
+    right = np.cross(direction, up)
+    right = right / np.linalg.norm(right)
+    up = np.cross(right, direction)
+    
+    vertices = []
+    for i in range(num_sides):
+        angle = 2 * np.pi * i / num_sides
+        offset_vec = radius * (np.cos(angle) * right + np.sin(angle) * up)
+        vertices.append(p1 + offset_vec)
+        vertices.append(p2 + offset_vec)
+    vertices = np.array(vertices)
+    
+    faces = []
+    for i in range(num_sides):
+        next_i = (i + 1) % num_sides
+        v1, v2 = offset + 2 * i, offset + 2 * i + 1
+        v3, v4 = offset + 2 * next_i + 1, offset + 2 * next_i
+        faces.append([v1, v2, v3, v4])
+    return vertices, faces
+
+def gen_sphere_from_point(center, resolution=8, radius=0.015):
+    center = np.array(center)
+    vertices = []
+    for i in range(resolution):
+        theta = np.pi * i / (resolution - 1)
+        for j in range(resolution):
+            phi = 2 * np.pi * j / resolution
+            x = radius * np.sin(theta) * np.cos(phi)
+            y = radius * np.sin(theta) * np.sin(phi)
+            z = radius * np.cos(theta)
+            vertices.append(center + np.array([x, y, z]))
+    vertices = np.array(vertices)
+    
+    faces = []
+    for i in range(resolution - 1):
+        for j in range(resolution):
+            next_j = (j + 1) % resolution
+            v1 = i * resolution + j
+            v2 = i * resolution + next_j
+            v3 = (i + 1) * resolution + next_j
+            v4 = (i + 1) * resolution + j
+            faces.append([v1, v2, v3, v4])
+    return vertices, faces
+
+def gen_cylinder_quads(rows, cols, offset, flag_xclose=False):
+    faces = []
+    for i in range(rows - 1):
+        for j in range(cols - 1):
+            v1 = offset + i * cols + j
+            v2, v3 = v1 + 1, v1 + cols
+            v4 = v3 + 1
+            faces.append([v1, v2, v4, v3])
+    
+    if flag_xclose:
+        for i in range(rows - 1):
+            v1 = offset + i * cols + (cols - 1)
+            v2 = offset + i * cols
+            v3 = offset + (i + 1) * cols
+            v4 = offset + (i + 1) * cols + (cols - 1)
+            faces.append([v1, v2, v3, v4])
+    return faces
+
+def write_obj_grouped(filename, vert_groups, face_groups, mtl_groups, group_names):
+    with open(filename, 'w') as f:
+        f.write("# Generated by Visualizer\nmtllib default.mtl\n\n")
+        for verts, faces, mtl, name in zip(vert_groups, face_groups, mtl_groups, group_names):
+            if len(verts) == 0:
+                continue
+            f.write(f"\no {name}\nusemtl {mtl}\n")
+            for v in verts:
+                f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+            for face in faces:
+                if len(face) == 4:
+                    f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1} {face[3]+1}\n")
+                elif len(face) == 3:
+                    f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+
+def create_default_mtl(mtl_path):
+    """创建默认材质库"""
+    with open(mtl_path, 'w') as f:
+        f.write("# Default materials\n\n")
+        colors = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0),
+                  (1.0, 1.0, 0.0), (1.0, 0.0, 1.0), (0.0, 1.0, 1.0),
+                  (1.0, 0.5, 0.0), (0.5, 1.0, 0.0), (0.0, 1.0, 0.5),
+                  (0.5, 0.0, 1.0), (1.0, 0.0, 0.5), (0.0, 0.5, 1.0),
+                  (0.8, 0.8, 0.8), (0.5, 0.5, 0.5), (0.3, 0.3, 0.3)]
+        for i, color in enumerate(colors):
+            f.write(f"newmtl m{i}\nKa {color[0]:.3f} {color[1]:.3f} {color[2]:.3f}\n")
+            f.write(f"Kd {color[0]:.3f} {color[1]:.3f} {color[2]:.3f}\nKs 0.5 0.5 0.5\nNs 50.0\n\n")
+        f.write("newmtl cylinder\nKa 0.3 0.3 0.3\nKd 0.5 0.5 0.5\nKs 0.7 0.7 0.7\nNs 100.0\n\n")
+        f.write("newmtl sphere\nKa 1.0 0.8 0.0\nKd 1.0 0.843 0.0\nKs 1.0 1.0 0.5\nNs 200.0\n\n")
+
+# ==================== Corner提取 ====================
+def extract_corners_from_curves(curve_points, is_closed_prob, validity_prob, threshold=0.02):
+    """从开放曲线的端点提取corners并聚类"""
+    endpoints = []
+    endpoint_to_curve = []
+    
+    for i in range(len(curve_points)):
+        if validity_prob[i] < 0.3:
+            continue
+        if is_closed_prob[i] > 0.5:
+            continue
+        
+        endpoints.append(curve_points[i][0])
+        endpoint_to_curve.append((i, 0))
+        
+        endpoints.append(curve_points[i][-1])
+        endpoint_to_curve.append((i, 1))
+    
+    if len(endpoints) == 0:
+        return np.zeros((0, 3)), []
+    
+    endpoints = np.array(endpoints)
+    
+    corner_positions = []
+    corner_to_curves = []
+    used = np.zeros(len(endpoints), dtype=bool)
+    
+    for i in range(len(endpoints)):
+        if used[i]:
+            continue
+        
+        cluster_points = [endpoints[i]]
+        cluster_curves = [endpoint_to_curve[i]]
+        
+        for j in range(i+1, len(endpoints)):
+            if not used[j]:
+                dist = np.linalg.norm(endpoints[i] - endpoints[j])
+                if dist < threshold:
+                    cluster_points.append(endpoints[j])
+                    cluster_curves.append(endpoint_to_curve[j])
+                    used[j] = True
+        
+        corner_positions.append(np.mean(cluster_points, axis=0))
+        curve_ids = list(set([c[0] for c in cluster_curves]))
+        corner_to_curves.append(curve_ids)
+        used[i] = True
+    
+    return np.array(corner_positions), corner_to_curves
+
+def load_checkpoint_robust(checkpoint_path, device, logger=None):
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    
+    if logger:
+        logger.info(f"Loading checkpoint from: {checkpoint_path}")
+    
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    config = checkpoint.get('config', None)
+    if config is None:
+        if logger:
+            logger.warning("Config not found in checkpoint, using default Config()")
+        config = Config()
+    else:
+        if logger:
+            logger.info("✓ Loaded config from checkpoint")
+    
+    if logger and 'epoch' in checkpoint:
+        logger.info(f"Checkpoint epoch: {checkpoint['epoch']}")
+        if 'val_loss' in checkpoint:
+            logger.info(f"Checkpoint val_loss: {checkpoint['val_loss']:.6f}")
+    
+    return checkpoint, config
+
+def remove_ddp_prefix(state_dict):
+    return {k[7:] if k.startswith('module.') else k: v for k, v in state_dict.items()}
+
+def move_to_device(data_dict, device):
+    """将预处理好的数据移动到GPU"""
+    if data_dict is None:
+        return None
+    return {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v 
+            for k, v in data_dict.items()}
 
 class Visualizer:
-    def __init__(self, checkpoint_path, config, device='cuda'):
+    def __init__(self, checkpoint_path, config, device, logger=None, rank=0):
         self.config = config
         self.device = device
+        self.logger = logger
+        self.rank = rank
         self.results = []
-
-        print(f"Loading checkpoint: {checkpoint_path}")
+        
+        if self.logger and self.rank == 0:
+            self.logger.info(f"{'='*70}")
+            self.logger.info(f"Initializing Visualizer (Autoencoder Model)")
+            self.logger.info(f"{'='*70}")
+            self.logger.info(f"Device: {device}")
+            self.logger.info(f"Curve Latent Dim: {config.CURVE_LATENT_DIM}")
+            self.logger.info(f"Patch Latent Dim: {config.PATCH_LATENT_DIM}")
+        
         self.load_models(checkpoint_path)
 
     def load_models(self, checkpoint_path):
+        checkpoint, _ = load_checkpoint_robust(checkpoint_path, self.device, self.logger)
+        
         self.patch_encoder = PatchEncoder(self.config).to(self.device)
         self.patch_decoder = PatchDecoder(self.config).to(self.device)
         self.curve_encoder = CurveEncoder(self.config).to(self.device)
         self.curve_decoder = CurveDecoder(self.config).to(self.device)
-
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
-        # 处理多GPU训练保存的checkpoint（去掉'module.'前缀）
-        def remove_module_prefix(state_dict):
-            """去掉DDP/DataParallel训练时添加的'module.'前缀"""
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                # 如果key以'module.'开头，去掉前缀
-                if k.startswith('module.'):
-                    new_state_dict[k[7:]] = v  # 7 = len('module.')
-                else:
-                    new_state_dict[k] = v
-            return new_state_dict
+        try:
+            self.patch_encoder.load_state_dict(remove_ddp_prefix(checkpoint['patch_encoder']))
+            self.patch_decoder.load_state_dict(remove_ddp_prefix(checkpoint['patch_decoder']))
+            self.curve_encoder.load_state_dict(remove_ddp_prefix(checkpoint['curve_encoder']))
+            self.curve_decoder.load_state_dict(remove_ddp_prefix(checkpoint['curve_decoder']))
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Failed to load checkpoint: {e}")
+            raise
         
-        # 加载模型权重（自动处理单/多GPU checkpoint）
-        self.patch_encoder.load_state_dict(remove_module_prefix(checkpoint['patch_encoder']))
-        self.patch_decoder.load_state_dict(remove_module_prefix(checkpoint['patch_decoder']))
-        self.curve_encoder.load_state_dict(remove_module_prefix(checkpoint['curve_encoder']))
-        self.curve_decoder.load_state_dict(remove_module_prefix(checkpoint['curve_decoder']))
-
         self.patch_encoder.eval()
         self.patch_decoder.eval()
         self.curve_encoder.eval()
         self.curve_decoder.eval()
         
-        print("✓ Models loaded successfully (auto-handled single/multi-GPU checkpoint)")
+        if self.logger and self.rank == 0:
+            self.logger.info("✓ Autoencoder models loaded and set to eval mode")
 
     @torch.no_grad()
     def evaluate(self, dataloader, max_samples=None):
-        print("Evaluating dataset...")
-        for batch_idx, data_item in enumerate(tqdm(dataloader)):
+        if self.logger and self.rank == 0:
+            self.logger.info(f"{'='*70}")
+            self.logger.info("Starting evaluation...")
+            self.logger.info(f"{'='*70}")
+        
+        pbar = tqdm(dataloader, disable=self.rank != 0, desc="Evaluating")
+        
+        curve_losses = []
+        patch_losses = []
+        
+        for batch_idx, data_item in enumerate(pbar):
             if max_samples and batch_idx >= max_samples:
                 break
+            
+            try:
+                if batch_idx == 0 and self.logger and self.rank == 0:
+                    self.logger.info(f"DEBUG: data_item type: {type(data_item)}")
+                    if isinstance(data_item, (tuple, list)):
+                        self.logger.info(f"DEBUG: data_item length: {len(data_item)}")
+                        for i, item in enumerate(data_item[:3]):  # 只看前3个元素
+                            self.logger.info(f"DEBUG: data_item[{i}] type: {type(item)}")
+                            if isinstance(item, dict):
+                                self.logger.info(f"DEBUG: data_item[{i}] keys: {list(item.keys())[:5]}")  # 只显示前5个key
+                            elif isinstance(item, torch.Tensor):
+                                self.logger.info(f"DEBUG: data_item[{i}] shape: {item.shape}")
+                
+                processed_curves = None
+                processed_patches = None
+                
+                if isinstance(data_item, dict):
+                    if 'curve_points' in data_item:
+                        processed_curves = data_item
+                    if 'patch_points' in data_item:
+                        processed_patches = data_item
+                
+                elif isinstance(data_item, (tuple, list)):
+                    if len(data_item) == 2:
+                        if isinstance(data_item[0], dict) and isinstance(data_item[1], dict):
+                            processed_curves, processed_patches = data_item
+                        elif isinstance(data_item[0], dict):
+                            batch_data = data_item[0]
+                            if 'curve_points' in batch_data:
+                                processed_curves = batch_data
+                            if 'patch_points' in batch_data:
+                                processed_patches = batch_data
+                    elif len(data_item) >= 1:
+                        if isinstance(data_item[0], dict):
+                            batch_data = data_item[0]
+                            if 'curve_points' in batch_data:
+                                processed_curves = batch_data
+                            if 'patch_points' in batch_data:
+                                processed_patches = batch_data
+                
+                if processed_curves is None and processed_patches is None:
+                    if self.logger:
+                        self.logger.error(f"Cannot parse data format at batch {batch_idx}. Type: {type(data_item)}")
+                    continue
+                
+                processed_curves = move_to_device(processed_curves, self.device)
+                processed_patches = move_to_device(processed_patches, self.device)
+                
+                sample_id = f"sample_{batch_idx:06d}"
+                
+                result = {
+                    'sample_id': sample_id,
+                    'curve_loss': 0.0,
+                    'patch_loss': 0.0
+                }
+                
+                if processed_patches is not None and 'patch_points' in processed_patches:
+                    try:
+                        latent_p = self.patch_encoder(
+                            processed_patches["patch_points"],
+                            processed_patches["patch_normals"],
+                            processed_patches["u_closed"],
+                            processed_patches["v_closed"],
+                            processed_patches["labels"],
+                            processed_patches["scale"],
+                            processed_patches["center"],
+                            processed_patches["mask"]
+                        )
+                        if isinstance(latent_p, tuple):
+                            latent_p = latent_p[0]
+                        pred_p = self.patch_decoder(latent_p)
+                    
+                        target_patch = {
+                            "points": processed_patches["patch_points"],
+                            "normals": processed_patches["patch_normals"],
+                            "u_closed": processed_patches["u_closed"],
+                            "v_closed": processed_patches["v_closed"],
+                            "labels": processed_patches["labels"],
+                            "scale": processed_patches["scale"],
+                            "center": processed_patches["center"]
+                        }
+                        metrics = compute_patch_metrics(pred_p, target_patch, processed_patches["mask"])
+                        result['patch_loss'] = metrics['recon_error']
+                        patch_losses.append(result['patch_loss'])
+                        
+                        result['patch_pred'] = pred_p
+                        result['patch_gt'] = processed_patches
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.warning(f"Patch processing failed for {sample_id}: {e}")
+                            import traceback
+                            self.logger.warning(traceback.format_exc())
+                
+                if processed_curves is not None and 'curve_points' in processed_curves:
+                    try:
+                        latent_c = self.curve_encoder(
+                            processed_curves["curve_points"],
+                            processed_curves["endpoints"],
+                            processed_curves["is_closed"],
+                            processed_curves["labels"],
+                            processed_curves["scale"],
+                            processed_curves["center"],
+                            processed_curves["mask"]
+                        )
+                        if isinstance(latent_c, tuple):
+                            latent_c = latent_c[0]
+                        pred_c = self.curve_decoder(latent_c)
+                        
+                        target_curve = {
+                            "points": processed_curves["curve_points"],
+                            "endpoints": processed_curves["endpoints"],
+                            "is_closed": processed_curves["is_closed"],
+                            "labels": processed_curves["labels"],
+                            "scale": processed_curves["scale"],
+                            "center": processed_curves["center"]
+                        }
+                        metrics = compute_curve_metrics(pred_c, target_curve, processed_curves["mask"])
+                        result['curve_loss'] = metrics['recon_error']
+                        curve_losses.append(result['curve_loss'])
+                        
+                        result['curve_pred'] = pred_c
+                        result['curve_gt'] = processed_curves
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.warning(f"Curve processing failed for {sample_id}: {e}")
+                            import traceback
+                            self.logger.warning(traceback.format_exc())
+                
+                self.results.append(result)
+                
+                if self.rank == 0:
+                    pbar.set_postfix({
+                        'curve': f"{result['curve_loss']:.4f}",
+                        'patch': f"{result['patch_loss']:.4f}"
+                    })
+                    
+            except Exception as e:
+                if self.logger:
+                    self.logger.error(f"Failed to process batch {batch_idx}: {e}")
+                    import traceback
+                    self.logger.error(traceback.format_exc())
+                continue
+        
+        if self.logger and self.rank == 0:
+            self.logger.info(f"✓ Evaluated {len(self.results)} samples")
+            if curve_losses:
+                self.logger.info(f"Curve Loss - Mean: {np.mean(curve_losses):.6f}, Std: {np.std(curve_losses):.6f}")
+            if patch_losses:
+                self.logger.info(f"Patch Loss - Mean: {np.mean(patch_losses):.6f}, Std: {np.std(patch_losses):.6f}")
 
-            sample_id = data_item[5][0].replace("_fix.pkl", "")
-            processed_curves, processed_patches = process_batch_data(
-                data_item, self.config, self.device
-            )
-
-            result = {'sample_id': sample_id, 'curve_loss': 0.0, 'patch_loss': 0.0}
-
-            # Evaluate patches
-            if processed_patches is not None:
-                mean_p, _ = self.patch_encoder(
-                    processed_patches["patch_points"],
-                    processed_patches["patch_normals"],
-                    processed_patches["u_closed"],
-                    processed_patches["v_closed"],
-                    processed_patches["labels"],
-                    processed_patches["mask"],
-                )
-                pred_p = self.patch_decoder(mean_p)
-
-                mask = processed_patches["mask"].unsqueeze(-1).unsqueeze(-1)
-                patch_error = ((pred_p["points"] - processed_patches["patch_points"]) ** 2 * mask).sum()
-                patch_error = patch_error / processed_patches["mask"].sum().clamp(min=1)
-                result['patch_loss'] = patch_error.item()
-
-                result['patch_pred'] = pred_p
-                result['patch_gt'] = processed_patches
-
-            # Evaluate curves
-            if processed_curves is not None:
-                mean_c, _ = self.curve_encoder(
-                    processed_curves["curve_points"],
-                    processed_curves["endpoints"],
-                    processed_curves["is_closed"],
-                    processed_curves["labels"],
-                    processed_curves["mask"],
-                )
-                pred_c = self.curve_decoder(mean_c)
-
-                mask = processed_curves["mask"].unsqueeze(-1).unsqueeze(-1)
-                curve_error = ((pred_c["points"] - processed_curves["curve_points"]) ** 2 * mask).sum()
-                curve_error = curve_error / processed_curves["mask"].sum().clamp(min=1)
-                result['curve_loss'] = curve_error.item()
-
-                result['curve_pred'] = pred_c
-                result['curve_gt'] = processed_curves
-
-            self.results.append(result)
-
-        print(f"Evaluated {len(self.results)} samples")
-
-    def get_worst_samples(self, n=10, sort_by='total'):
-        if sort_by == 'total':
-            key = lambda x: x['curve_loss'] + x['patch_loss']
+    def get_worst_samples(self, n=10, sort_by='separate'):
+        """获取重建误差最大的n个样本"""
+        if sort_by == 'separate':
+            worst_curve = sorted(self.results, key=lambda x: x['curve_loss'], reverse=True)[:n]
+            worst_patch = sorted(self.results, key=lambda x: x['patch_loss'], reverse=True)[:n]
+            
+            seen = set()
+            combined = []
+            for r in worst_curve + worst_patch:
+                if r['sample_id'] not in seen:
+                    seen.add(r['sample_id'])
+                    combined.append(r)
+            return combined, worst_curve, worst_patch
+            
+        elif sort_by == 'total':
+            worst = sorted(self.results, key=lambda x: x['curve_loss'] + x['patch_loss'], reverse=True)[:n]
+            return worst, worst, worst
+            
         elif sort_by == 'curve':
-            key = lambda x: x['curve_loss']
-        elif sort_by == 'patch':
-            key = lambda x: x['patch_loss']
+            worst = sorted(self.results, key=lambda x: x['curve_loss'], reverse=True)[:n]
+            return worst, worst, worst
+            
+        else:  # 'patch'
+            worst = sorted(self.results, key=lambda x: x['patch_loss'], reverse=True)[:n]
+            return worst, worst, worst
 
-        sorted_results = sorted(self.results, key=key, reverse=True)
-        return sorted_results[:n]
+    def get_best_samples(self, n=10, sort_by='separate'):
+        """获取重建误差最小的n个样本"""
+        if sort_by == 'separate':
+            best_curve = sorted(self.results, key=lambda x: x['curve_loss'])[:n]
+            best_patch = sorted(self.results, key=lambda x: x['patch_loss'])[:n]
+            
+            seen = set()
+            combined = []
+            for r in best_curve + best_patch:
+                if r['sample_id'] not in seen:
+                    seen.add(r['sample_id'])
+                    combined.append(r)
+            return combined, best_curve, best_patch
+            
+        elif sort_by == 'total':
+            best = sorted(self.results, key=lambda x: x['curve_loss'] + x['patch_loss'])[:n]
+            return best, best, best
+            
+        elif sort_by == 'curve':
+            best = sorted(self.results, key=lambda x: x['curve_loss'])[:n]
+            return best, best, best
+            
+        else:  # 'patch'
+            best = sorted(self.results, key=lambda x: x['patch_loss'])[:n]
+            return best, best, best
 
-    def export_sample(self, result, output_dir):
+    def export_simple_obj(self, result, output_dir, export_pred=True, export_gt=True):
+        """导出OBJ文件用于可视化"""
         sample_id = result['sample_id']
-        out_dir = Path(output_dir) / sample_id
+        out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+        
+        mtl_path = out_dir / "default.mtl"
+        if not mtl_path.exists():
+            create_default_mtl(mtl_path)
+        
+        if export_gt and 'curve_gt' in result:
+            self._export_obj(result, out_dir / f"{sample_id}_gt.obj", use_pred=False)
+        
+        if export_pred and 'curve_pred' in result:
+            self._export_obj(result, out_dir / f"{sample_id}_pred.obj", use_pred=True)
 
-        # Export curves
+    def _export_obj(self, result, obj_path, use_pred=False):
+        allverts, allfaces, allmtl, allnames = [], [], [], []
+        counter = 0
+        
+        # === Patches ===
+        if 'patch_gt' in result:
+            gt = result['patch_gt']
+            mask = gt['mask'][0].cpu().numpy().astype(bool)
+            valid = np.where(mask)[0]
+            
+            if use_pred and 'patch_pred' in result:
+                pred = result['patch_pred']
+                pts = pred['points'][0][valid].cpu().numpy()
+                u_closed_prob = torch.sigmoid(pred['u_closed_logits'][0][valid]).cpu().numpy()
+                labels = torch.argmax(pred['label_logits'][0][valid], dim=-1).cpu().numpy()
+            else:
+                pts = gt['patch_points'][0][valid].cpu().numpy()
+                u_closed_prob = gt['u_closed'][0][valid].cpu().numpy()
+                labels = gt['labels'][0][valid].cpu().numpy()
+            
+            scale = gt['scale'][0][valid].cpu().numpy()
+            center = gt['center'][0][valid].cpu().numpy()
+            
+            for i, (p, uc, l, s, c) in enumerate(zip(pts, u_closed_prob, labels, scale, center)):
+                p_denorm = p * s.reshape(1, 1) + c.reshape(1, 3)
+                
+                allnames.append(f'patch_{i}_{patch_type_list[l]}')
+                allmtl.append(f'm{i % 15}')
+                
+                p_grid = p_denorm.reshape(20, 20, 3)
+                p_transposed = np.transpose(p_grid, (1, 0, 2))
+                allverts.append(p_transposed.reshape(-1, 3))
+                
+                allfaces.append(gen_cylinder_quads(20, 20, counter, flag_xclose=(uc > 0.5)))
+                counter += 400
+        
+        # === Curves ===
+        if 'curve_gt' in result:
+            gt = result['curve_gt']
+            mask = gt['mask'][0].cpu().numpy().astype(bool)
+            valid = np.where(mask)[0]
+            
+            if use_pred and 'curve_pred' in result:
+                pred = result['curve_pred']
+                pts = pred['points'][0][valid].cpu().numpy()
+                closed_prob = torch.sigmoid(pred['closed_logits'][0][valid]).cpu().numpy()
+                labels = torch.argmax(pred['label_logits'][0][valid], dim=-1).cpu().numpy()
+            else:
+                pts = gt['curve_points'][0][valid].cpu().numpy()
+                closed_prob = gt['is_closed'][0][valid].cpu().numpy()
+                labels = gt['labels'][0][valid].cpu().numpy()
+            
+            # 反归一化
+            scale = gt['scale'][0][valid].cpu().numpy()
+            center = gt['center'][0][valid].cpu().numpy()
+            
+            for i, (p, c, l, s, ctr) in enumerate(zip(pts, closed_prob, labels, scale, center)):
+                # 反归一化
+                p_denorm = p * s.reshape(1, 1) + ctr.reshape(1, 3)
+                
+                verts, faces = [], []
+                
+                for j in range(len(p_denorm) - 1):
+                    v, f = gen_cylinder_from_two_points(p_denorm[j], p_denorm[j+1], counter, radius=0.008)
+                    if len(f) > 0:
+                        verts.append(v)
+                        faces.extend(f)
+                        counter += len(v)
+                
+                if c > 0.5:
+                    v, f = gen_cylinder_from_two_points(p_denorm[-1], p_denorm[0], counter, radius=0.008)
+                    if len(f) > 0:
+                        verts.append(v)
+                        faces.extend(f)
+                        counter += len(v)
+                
+                if verts:
+                    allnames.append(f'curve_{i}_{curve_type_list[l]}')
+                    allmtl.append('cylinder')
+                    allverts.append(np.concatenate(verts))
+                    allfaces.append(faces)
+        
+        # === Corners ===
+        if 'curve_gt' in result:
+            gt = result['curve_gt']
+            mask = gt['mask'][0].cpu().numpy().astype(bool)
+            valid = np.where(mask)[0]
+            
+            if use_pred and 'curve_pred' in result:
+                pred = result['curve_pred']
+                pts = pred['points'][0][valid].cpu().numpy()
+                closed_prob = torch.sigmoid(pred['closed_logits'][0][valid]).cpu().numpy()
+            else:
+                pts = gt['curve_points'][0][valid].cpu().numpy()
+                closed_prob = gt['is_closed'][0][valid].cpu().numpy()
+            
+            # 反归一化
+            scale = gt['scale'][0][valid].cpu().numpy()
+            center = gt['center'][0][valid].cpu().numpy()
+            pts_denorm = pts * scale.reshape(-1, 1, 1) + center.reshape(-1, 1, 3)
+            
+            corners, _ = extract_corners_from_curves(
+                pts_denorm, closed_prob, np.ones(len(pts)), threshold=0.02
+            )
+            
+            for i, corner in enumerate(corners):
+                v, f = gen_sphere_from_point(corner, resolution=8, radius=0.02)
+                allnames.append(f'corner_{i}')
+                allmtl.append('sphere')
+                allverts.append(v)
+                allfaces.append(f)
+                counter += len(v)
+        
+        write_obj_grouped(obj_path, allverts, allfaces, allmtl, allnames)
+
+    def export_extraction_pickle(self, result, output_dir):
+        """导出用于extraction.py的pickle文件"""
+        sample_id = result['sample_id']
+        out_path = Path(output_dir) / f"{sample_id}_prediction.pkl"
+        
+        # ===== Curves =====
+        curve_data = {
+            'prediction': {
+                'points': np.zeros((100, 34, 3)),
+                'valid_prob': np.zeros(100),
+                'closed_prob': np.zeros(100),
+                'type_prob': np.zeros((100, 4))
+            }
+        }
+        
         if 'curve_pred' in result:
-            self._export_curves(result, out_dir)
-
-        # Export patches
+            pred = result['curve_pred']
+            gt = result['curve_gt']
+            
+            gt_mask = gt['mask'][0].cpu().numpy().astype(bool)
+            pred_validity = torch.sigmoid(pred['validity_logits'][0]).cpu().numpy()
+            valid_idx = np.where(gt_mask & (pred_validity > 0.3))[0]
+            n_curves = len(valid_idx)
+            
+            # 反归一化到原始空间
+            scale = gt['scale'][0][valid_idx].cpu().numpy()
+            center = gt['center'][0][valid_idx].cpu().numpy()
+            pts_norm = pred['points'][0][valid_idx].cpu().numpy()
+            pts_denorm = pts_norm * scale.reshape(-1, 1, 1) + center.reshape(-1, 1, 3)
+            
+            curve_data['prediction']['points'][:n_curves] = pts_denorm
+            curve_data['prediction']['valid_prob'][:n_curves] = pred_validity[valid_idx]
+            
+            closed_prob = torch.sigmoid(pred['closed_logits'][0]).cpu().numpy()
+            curve_data['prediction']['closed_prob'][:n_curves] = closed_prob[valid_idx]
+            
+            label_prob = torch.softmax(pred['label_logits'][0], dim=-1).cpu().numpy()
+            curve_data['prediction']['type_prob'][:n_curves] = label_prob[valid_idx]
+        
+        # ===== Patches =====
+        patch_data = {
+            'prediction': {
+                'points': np.zeros((100, 400, 3)),
+                'valid_prob': np.zeros(100),
+                'type_prob': np.zeros((100, 6)),
+                'closed_prob': np.zeros(100)
+            }
+        }
+        
         if 'patch_pred' in result:
-            self._export_patches(result, out_dir)
-
-        # Export statistics
-        stats_path = out_dir / "stats.txt"
-        with open(stats_path, 'w') as f:
-            f.write(f"Sample: {sample_id}\n")
-            f.write(f"Curve Loss: {result['curve_loss']:.6f}\n")
-            f.write(f"Patch Loss: {result['patch_loss']:.6f}\n")
-            f.write(f"Total Loss: {result['curve_loss'] + result['patch_loss']:.6f}\n")
-
-    def _export_curves(self, result, out_dir):
-        pred = result['curve_pred']
-        gt_data = result['curve_gt']
-
-        mask = gt_data['mask'][0].cpu().numpy()
-        valid_idx = np.where(mask)[0]
-
-        if len(valid_idx) == 0:
-            return
-
-        sample_id = result['sample_id']
-
-        pred_pts = pred['points'][0][valid_idx].cpu().numpy().reshape(-1, 3)
-        pred_labels = torch.argmax(pred['label_logits'][0], dim=-1)[valid_idx].cpu().numpy()
-
-        pred_colors = []
-        for label in pred_labels:
-            color = curve_colormap[curve_type_list[label]]
-            pred_colors.extend([color] * 34)
-        pred_colors = np.array(pred_colors)
-
-        plywrite.save_vert_color_ply(
-            pred_pts, pred_colors,
-            str(out_dir / f"{sample_id}_curve_pred.ply")
-        )
-
-        gt_pts = gt_data['curve_points'][0][valid_idx].cpu().numpy().reshape(-1, 3)
-        gt_labels = gt_data['labels'][0][valid_idx].cpu().numpy()
-
-        gt_colors = []
-        for label in gt_labels:
-            color = curve_colormap[curve_type_list[label]]
-            gt_colors.extend([color] * 34)
-        gt_colors = np.array(gt_colors)
-
-        plywrite.save_vert_color_ply(
-            gt_pts, gt_colors,
-            str(out_dir / f"{sample_id}_curve_gt.ply")
-        )
-
-    def _export_patches(self, result, out_dir):
-        pred = result['patch_pred']
-        gt_data = result['patch_gt']
-
-        mask = gt_data['mask'][0].cpu().numpy()
-        valid_idx = np.where(mask)[0]
-
-        if len(valid_idx) == 0:
-            return
-
-        sample_id = result['sample_id']
-
-        pred_pts = pred['points'][0][valid_idx].cpu().numpy().reshape(-1, 3)
-        pred_labels = torch.argmax(pred['label_logits'][0], dim=-1)[valid_idx].cpu().numpy()
-
-        pred_colors = []
-        for label in pred_labels:
-            color = patch_colormap[patch_type_list[label]]
-            pred_colors.extend([color] * 400)
-        pred_colors = np.array(pred_colors)
-
-        plywrite.save_vert_color_ply(
-            pred_pts, pred_colors,
-            str(out_dir / f"{sample_id}_patch_pred.ply")
-        )
-
-        gt_pts = gt_data['patch_points'][0][valid_idx].cpu().numpy().reshape(-1, 3)
-        gt_labels = gt_data['labels'][0][valid_idx].cpu().numpy()
-
-        gt_colors = []
-        for label in gt_labels:
-            color = patch_colormap[patch_type_list[label]]
-            gt_colors.extend([color] * 400)
-        gt_colors = np.array(gt_colors)
-
-        plywrite.save_vert_color_ply(
-            gt_pts, gt_colors,
-            str(out_dir / f"{sample_id}_patch_gt.ply")
-        )
-
+            pred = result['patch_pred']
+            gt = result['patch_gt']
+            
+            gt_mask = gt['mask'][0].cpu().numpy().astype(bool)
+            pred_validity = torch.sigmoid(pred['validity_logits'][0]).cpu().numpy()
+            valid_idx = np.where(gt_mask & (pred_validity > 0.3))[0]
+            n_patches = len(valid_idx)
+            
+            # 反归一化
+            scale = gt['scale'][0][valid_idx].cpu().numpy()
+            center = gt['center'][0][valid_idx].cpu().numpy()
+            pts_norm = pred['points'][0][valid_idx].cpu().numpy()
+            pts_denorm = pts_norm * scale.reshape(-1, 1, 1) + center.reshape(-1, 1, 3)
+            
+            patch_data['prediction']['points'][:n_patches] = pts_denorm
+            patch_data['prediction']['valid_prob'][:n_patches] = pred_validity[valid_idx]
+            
+            u_closed_prob = torch.sigmoid(pred['u_closed_logits'][0]).cpu().numpy()
+            patch_data['prediction']['closed_prob'][:n_patches] = u_closed_prob[valid_idx]
+            
+            label_prob = torch.softmax(pred['label_logits'][0], dim=-1).cpu().numpy()
+            patch_data['prediction']['type_prob'][:n_patches] = label_prob[valid_idx]
+        
+        # ===== Corners =====
+        corner_positions = np.zeros((100, 3))
+        corner_valid = np.zeros(100)
+        
+        if 'curve_pred' in result and n_curves > 0:
+            corners, _ = extract_corners_from_curves(
+                curve_data['prediction']['points'][:n_curves],
+                curve_data['prediction']['closed_prob'][:n_curves],
+                curve_data['prediction']['valid_prob'][:n_curves],
+                threshold=0.02
+            )
+            
+            n_corners = min(len(corners), 100)
+            if n_corners > 0:
+                corner_positions[:n_corners] = corners[:n_corners]
+                corner_valid[:n_corners] = 1.0
+        
+        corner_data = {
+            'prediction': {
+                'position': corner_positions,
+                'valid_prob': corner_valid
+            }
+        }
+        
+        data = {
+            'sample_id': sample_id,
+            'corners': corner_data,
+            'curves': curve_data,
+            'patches': patch_data,
+            'curve_corner_similarity': np.zeros((100, 100)),
+            'patch_curve_similarity': np.zeros((100, 100)),
+            'patch_corner_similarity': np.zeros((100, 100))
+        }
+        
+        with open(out_path, 'wb') as f:
+            pickle.dump(data, f)
 
 def main():
-    torch.autograd.set_detect_anomaly(True)
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--checkpoint', required=True, help='Checkpoint path')
-    parser.add_argument('--data', default='data/default/', help='Test data folder')
-    parser.add_argument('--output', default=None, help='Output directory (default: checkpoint parent dir / vis_output)')
+    parser = argparse.ArgumentParser(description='Visualize worst/best reconstruction samples (Autoencoder)')
+    parser.add_argument('--checkpoint', required=True, help='Model checkpoint path')
+    parser.add_argument('--data', default='data/default/val', help='Data folder')
+    parser.add_argument('--output', required=True, help='Output directory')
+    parser.add_argument('--mode', default='simple', choices=['simple', 'extraction'],
+                       help='Export mode: simple OBJ or extraction pickle')
     parser.add_argument('--n_worst', type=int, default=10, help='Number of worst samples')
-    parser.add_argument('--sort_by', default='total', choices=['total', 'curve', 'patch'])
-    parser.add_argument('--max_eval', type=int, default=None, help='Max samples to evaluate')
-    parser.add_argument('--input_voxel_dim', type=int, default=128, help='voxel dimension for dataloader')
+    parser.add_argument('--n_best', type=int, default=10, help='Number of best samples')
+    parser.add_argument('--sort_by', default='separate',
+                       choices=['total', 'curve', 'patch', 'separate'],
+                       help='Sorting strategy')
+    parser.add_argument('--max_eval', type=int, default=None,
+                       help='Max samples to evaluate (None=all)')
+    parser.add_argument('--export_pred', action='store_true', default=True,
+                       help='Export predictions')
+    parser.add_argument('--export_gt', action='store_true', default=True,
+                       help='Export ground truth')
+    parser.add_argument('--export_best', action='store_true',
+                       help='Also export best samples (not just worst)')
+    parser.add_argument('--batch_size', type=int, default=1)
+    parser.add_argument('--grid_dim', type=int, default=20, help='Patch grid dimension')
+    parser.add_argument('--rotation_augment', action='store_true', help='Use rotation augmentation')
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of dataloader workers')
     args = parser.parse_args()
 
-    checkpoint_path = Path(args.checkpoint)
-    checkpoint_parent = checkpoint_path.parent.parent
-
-    if args.output is None:
-        args.output = str(checkpoint_parent / 'vis_output')
-        print(f"Output directory automatically set to: {args.output}")
-
-    config = Config()
-
-    # Decide whether to initialize distributed group.
-    # Only initialize if the environment indicates a multi-process launch (WORLD_SIZE>1).
-    use_distributed = False
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-
-    if world_size and world_size > 1:
-        # We assume the user launched with torchrun or mp.spawn and env vars are set.
-        use_distributed = True
-
-    if use_distributed:
-        # initialize distributed (only when torchrun/mp.spawn provided WORLD_SIZE/RANK)
-        print(f"[Distributed] rank={rank}, world_size={world_size}, initializing process group...")
-        dist.init_process_group(
-            backend="nccl" if torch.cuda.is_available() else "gloo",
-            init_method="env://",  # use env to be compatible with torchrun
-            world_size=world_size,
-            rank=rank,
-        )
-        # set device based on rank
-        if torch.cuda.is_available():
-            torch.cuda.set_device(rank % torch.cuda.device_count())
-            device = f"cuda:{rank % torch.cuda.device_count()}"
-        else:
-            device = "cpu"
-    else:
-        # Single-process fallback (safe mode) — won't init process group
-        if torch.cuda.is_available():
-            device = "cuda"
-        else:
-            device = "cpu"
-        print(f"[Single-process mode] Using device: {device}")
-
-    # Load data — pass voxel dim from args (no global dependency)
-    print(f"Loading data from: {args.data}")
-    test_data, _ = train_data_loader(
-        batch_size=1,
-        voxel_dim=args.input_voxel_dim,
+    # 分布式初始化
+    rank, world_size, local_rank = setup_distributed()
+    
+    # 日志设置
+    logger = setup_logger(args.output, rank=rank)
+    
+    if logger:
+        logger.info(f"{'='*70}")
+        logger.info(f"Visualize Worst/Best Samples (Autoencoder Model - Optimized & Fixed)")
+        logger.info(f"{'='*70}")
+        logger.info(f"Distributed: world_size={world_size}, rank={rank}")
+        logger.info(f"Checkpoint: {args.checkpoint}")
+        logger.info(f"Data: {args.data}")
+        logger.info(f"Output: {args.output}")
+        logger.info(f"Mode: {args.mode}")
+    
+    # 加载config和checkpoint
+    device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+    checkpoint, config = load_checkpoint_robust(args.checkpoint, device, logger)
+    
+    # ==================== 关键修改：使用优化版数据加载器 ====================
+    test_data, _ = train_data_loader_clean(
+        batch_size=args.batch_size,
         data_folder=args.data,
-        feature_type='global',
-        pad1s=True,
-        rotation_augmentation=True,
-        with_normal=True,
-        flag_quick_test=False,
-        flag_noise=False,
+        rotation_augmentation=args.rotation_augment,  # validation通常不用augmentation
+        random_angle=False,
+        flag_noise=0,
         flag_grid=True,
-        flag_patch_uv=True,
-        dim_grid=20,
-        eval_res_cov=False,
+        num_angle=4,
+        dim_grid=args.grid_dim,
+        num_workers=args.num_workers,
+        rank=rank,
+        world_size=world_size
     )
-
-    # Create visualizer
-    vis = Visualizer(args.checkpoint, config, device)
-
-    # Evaluate
+    
+    # 评估
+    vis = Visualizer(args.checkpoint, config, device, logger=logger, rank=rank)
     vis.evaluate(test_data, max_samples=args.max_eval)
-
-    # Get worst samples
-    worst = vis.get_worst_samples(n=args.n_worst, sort_by=args.sort_by)
-
-    print(f"\nTop {args.n_worst} worst samples:")
-    print("-" * 70)
-    print(f"{'Rank':<6} {'Sample ID':<30} {'Curve':<12} {'Patch':<12} {'Total':<12}")
-    print("-" * 70)
-    for i, r in enumerate(worst, 1):
-        total = r['curve_loss'] + r['patch_loss']
-        print(f"{i:<6} {r['sample_id']:<30} {r['curve_loss']:<12.6f} {r['patch_loss']:<12.6f} {total:<12.6f}")
-
-    # Export
-    print(f"\nExporting to: {args.output}")
-    for r in tqdm(worst, desc="Exporting"):
-        vis.export_sample(r, args.output)
-
-    # Summary
-    summary_path = Path(args.output) / "summary.txt"
-    with open(summary_path, 'w') as f:
-        f.write(f"Worst {args.n_worst} samples (sorted by {args.sort_by})\n")
-        f.write("=" * 70 + "\n\n")
-        for i, r in enumerate(worst, 1):
-            f.write(f"Rank {i}: {r['sample_id']}\n")
-            f.write(f"  Curve Loss: {r['curve_loss']:.6f}\n")
-            f.write(f"  Patch Loss: {r['patch_loss']:.6f}\n")
-            f.write(f"  Total Loss: {r['curve_loss'] + r['patch_loss']:.6f}\n\n")
-
-    print(f"\n✓ Done! Results saved to: {args.output}")
-    print(f"✓ Summary: {summary_path}")
-    print("\nVisualization:")
-    print("  1. Open MeshLab")
-    print("  2. Load *_pred.ply and *_gt.ply files")
-    print("  3. Compare prediction with ground truth")
-
-    # If we initialized distributed group, clean up (optional)
-    if use_distributed and dist.is_initialized():
-        try:
-            dist.destroy_process_group()
-        except Exception:
-            pass
-
+    
+    if rank == 0:
+        # ===== 导出Worst样本 =====
+        combined_worst, worst_curve, worst_patch = vis.get_worst_samples(
+            n=args.n_worst, sort_by=args.sort_by
+        )
+        
+        logger.info(f"\n{'='*70}")
+        logger.info(f"WORST SAMPLES")
+        logger.info(f"{'='*70}")
+        
+        if args.sort_by == 'separate':
+            logger.info(f"\nTop {args.n_worst} worst by CURVE loss:")
+            logger.info(f"{'Rank':<6} {'Sample ID':<30} {'Curve Loss':<15}")
+            logger.info(f"{'-'*60}")
+            for i, r in enumerate(worst_curve, 1):
+                logger.info(f"{i:<6} {r['sample_id']:<30} {r['curve_loss']:<15.6f}")
+            
+            logger.info(f"\nTop {args.n_worst} worst by PATCH loss:")
+            logger.info(f"{'Rank':<6} {'Sample ID':<30} {'Patch Loss':<15}")
+            logger.info(f"{'-'*60}")
+            for i, r in enumerate(worst_patch, 1):
+                logger.info(f"{i:<6} {r['sample_id']:<30} {r['patch_loss']:<15.6f}")
+            
+            logger.info(f"\nTotal unique samples: {len(combined_worst)}")
+        else:
+            logger.info(f"\nTop {args.n_worst} worst samples (sort_by={args.sort_by}):")
+            logger.info(f"{'Rank':<6} {'Sample ID':<30} {'Curve':<12} {'Patch':<12} {'Total':<12}")
+            logger.info(f"{'-'*80}")
+            for i, r in enumerate(combined_worst, 1):
+                total = r['curve_loss'] + r['patch_loss']
+                logger.info(f"{i:<6} {r['sample_id']:<30} {r['curve_loss']:<12.6f} "
+                      f"{r['patch_loss']:<12.6f} {total:<12.6f}")
+        
+        # 导出worst
+        worst_dir = Path(args.output) / "worst"
+        worst_dir.mkdir(parents=True, exist_ok=True)
+        
+        if args.mode == 'simple':
+            logger.info(f"\nExporting worst samples to: {worst_dir}")
+            for r in tqdm(combined_worst, desc="Exporting worst OBJ"):
+                vis.export_simple_obj(r, worst_dir,
+                                     export_pred=args.export_pred,
+                                     export_gt=args.export_gt)
+            logger.info(f"✓ Done! View: meshlab {worst_dir}/*_gt.obj")
+        else:
+            logger.info(f"\nExporting worst samples to: {worst_dir}")
+            for r in tqdm(combined_worst, desc="Exporting worst Pickle"):
+                vis.export_extraction_pickle(r, worst_dir)
+            logger.info(f"✓ Done! Next: python extraction.py --folder {worst_dir} --type 1")
+        
+        # ===== 导出Best样本 =====
+        if args.export_best:
+            combined_best, best_curve, best_patch = vis.get_best_samples(
+                n=args.n_best, sort_by=args.sort_by
+            )
+            
+            logger.info(f"\n{'='*70}")
+            logger.info(f"BEST SAMPLES")
+            logger.info(f"{'='*70}")
+            
+            if args.sort_by == 'separate':
+                logger.info(f"\nTop {args.n_best} best by CURVE loss:")
+                logger.info(f"{'Rank':<6} {'Sample ID':<30} {'Curve Loss':<15}")
+                logger.info(f"{'-'*60}")
+                for i, r in enumerate(best_curve, 1):
+                    logger.info(f"{i:<6} {r['sample_id']:<30} {r['curve_loss']:<15.6f}")
+                
+                logger.info(f"\nTop {args.n_best} best by PATCH loss:")
+                logger.info(f"{'Rank':<6} {'Sample ID':<30} {'Patch Loss':<15}")
+                logger.info(f"{'-'*60}")
+                for i, r in enumerate(best_patch, 1):
+                    logger.info(f"{i:<6} {r['sample_id']:<30} {r['patch_loss']:<15.6f}")
+                
+                logger.info(f"\nTotal unique samples: {len(combined_best)}")
+            else:
+                logger.info(f"\nTop {args.n_best} best samples (sort_by={args.sort_by}):")
+                logger.info(f"{'Rank':<6} {'Sample ID':<30} {'Curve':<12} {'Patch':<12} {'Total':<12}")
+                logger.info(f"{'-'*80}")
+                for i, r in enumerate(combined_best, 1):
+                    total = r['curve_loss'] + r['patch_loss']
+                    logger.info(f"{i:<6} {r['sample_id']:<30} {r['curve_loss']:<12.6f} "
+                          f"{r['patch_loss']:<12.6f} {total:<12.6f}")
+            
+            # 导出best
+            best_dir = Path(args.output) / "best"
+            best_dir.mkdir(parents=True, exist_ok=True)
+            
+            if args.mode == 'simple':
+                logger.info(f"\nExporting best samples to: {best_dir}")
+                for r in tqdm(combined_best, desc="Exporting best OBJ"):
+                    vis.export_simple_obj(r, best_dir,
+                                         export_pred=args.export_pred,
+                                         export_gt=args.export_gt)
+                logger.info(f"✓ Done! View: meshlab {best_dir}/*_gt.obj")
+            else:
+                logger.info(f"\nExporting best samples to: {best_dir}")
+                for r in tqdm(combined_best, desc="Exporting best Pickle"):
+                    vis.export_extraction_pickle(r, best_dir)
+                logger.info(f"✓ Done! Next: python extraction.py --folder {best_dir} --type 1")
+        
+        logger.info(f"\n{'='*70}")
+        logger.info(f"All done!")
+        logger.info(f"{'='*70}")
+    
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 if __name__ == '__main__':
     main()
