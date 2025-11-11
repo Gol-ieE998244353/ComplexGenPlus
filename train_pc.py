@@ -1,4 +1,3 @@
-# train.py - 优化版本3（数据预处理前置）
 import argparse
 import torch
 import torch.nn as nn
@@ -17,7 +16,6 @@ from torch.cuda.amp import autocast, GradScaler
 
 from data_loader_optimized import *
 
-# ... [Config, MLP, MLP_hn 等类保持完全不变] ...
 class Config:
     D_MODEL = 512
     NHEAD = 8
@@ -395,7 +393,6 @@ class KLScheduler:
         progress = math.sqrt(epoch / self.warmup)
         return self.start + (self.end - self.start) * progress
 
-# ... [所有loss函数保持完全不变] ...
 def compute_curve_smoothness_loss(points, mask, tau=0.01):
     B, N, P, _ = points.shape
     first_deriv = points[:, :, 1:, :] - points[:, :, :-1, :]
@@ -524,14 +521,12 @@ def compute_curve_vae_loss(pred, target, mean, logvar, mask, kl_weight, config):
     return losses
 
 def move_to_device(data_dict, device):
-    """简化的数据移动函数 - 直接移动已处理好的数据到GPU"""
     if data_dict is None:
         return None
     return {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v 
             for k, v in data_dict.items()}
 
 def compute_patch_metrics(pred, target, mask):
-    """计算patch的评估指标"""
     metrics = {}
     pred_scale = target["scale"].unsqueeze(-1).unsqueeze(-1)
     pred_center = target["center"].unsqueeze(-2)
@@ -546,7 +541,6 @@ def compute_patch_metrics(pred, target, mask):
     return metrics
 
 def compute_curve_metrics(pred, target, mask):
-    """计算curve的评估指标"""
     metrics = {}
     pred_scale = target["scale"].unsqueeze(-1).unsqueeze(-1)
     pred_center = target["center"].unsqueeze(-2)
@@ -588,7 +582,6 @@ class LossAccumulator:
 def val_pipeline(patch_encoder, patch_decoder, curve_encoder, curve_decoder, 
                 val_dataloader, val_sampler, epoch, device, config, rank=0):
     """
-    验证流程 - 使用与训练相同的预处理数据
     """
     if val_sampler is not None:
         val_sampler.set_epoch(epoch)
@@ -604,12 +597,10 @@ def val_pipeline(patch_encoder, patch_decoder, curve_encoder, curve_decoder,
     with torch.no_grad():
         pbar = tqdm(val_dataloader, desc="Validation", leave=False) if rank == 0 else val_dataloader
         for data_item in pbar:
-            # 数据已经预处理好，直接移动到GPU
             processed_curves, processed_patches = data_item
             processed_curves = move_to_device(processed_curves, device)
             processed_patches = move_to_device(processed_patches, device)
             
-            # 处理patches
             if processed_patches is not None:
                 try:
                     mean_p, _ = patch_encoder(
@@ -624,7 +615,6 @@ def val_pipeline(patch_encoder, patch_decoder, curve_encoder, curve_decoder,
                     )
                     pred_patch = patch_decoder(mean_p)
                     
-                    # 计算重建误差（在原始空间）
                     pred_scale = processed_patches["scale"].unsqueeze(-1).unsqueeze(-1)
                     pred_center = processed_patches["center"].unsqueeze(-2)
                     pred_points_denorm = pred_patch["points"] * pred_scale + pred_center
@@ -638,7 +628,6 @@ def val_pipeline(patch_encoder, patch_decoder, curve_encoder, curve_decoder,
                 except:
                     continue
             
-            # 处理curves
             if processed_curves is not None:
                 try:
                     mean_c, _ = curve_encoder(
@@ -652,7 +641,6 @@ def val_pipeline(patch_encoder, patch_decoder, curve_encoder, curve_decoder,
                     )
                     pred_curve = curve_decoder(mean_c)
                     
-                    # 计算重建误差（在原始空间）
                     pred_scale = processed_curves["scale"].unsqueeze(-1).unsqueeze(-1)
                     pred_center = processed_curves["center"].unsqueeze(-2)
                     pred_points_denorm = pred_curve["points"] * pred_scale + pred_center
@@ -666,14 +654,12 @@ def val_pipeline(patch_encoder, patch_decoder, curve_encoder, curve_decoder,
                 except:
                     continue
     
-    # 计算平均指标
     val_metrics = {}
     if patch_recon_errors:
         val_metrics["patch"] = {"recon_error": torch.stack(patch_recon_errors).mean().item()}
     if curve_recon_errors:
         val_metrics["curve"] = {"recon_error": torch.stack(curve_recon_errors).mean().item()}
     
-    # 恢复训练模式
     patch_encoder.train()
     patch_decoder.train()
     curve_encoder.train()
@@ -710,7 +696,6 @@ def train_pipeline(rank, num_gpus, args, config):
             }
         )
     
-    # 使用优化后的dataloader - 数据已在Dataset中预处理
     if args.quicktest:
         train_data, distribute_sampler = train_data_loader_clean(
             args.batch_size, 
@@ -721,21 +706,20 @@ def train_pipeline(rank, num_gpus, args, config):
             flag_grid=args.patch_grid, 
             num_angle=args.num_angles, 
             dim_grid=args.points_per_patch_dim, 
-            num_workers=4,  # 使用多进程加速数据预处理
+            num_workers=4,
             rank=rank, 
             world_size=num_gpus
         )
-        # Validation data（不使用augmentation）
         val_data, val_sampler = train_data_loader_clean(
             args.batch_size,
             data_folder="data/train_small",
-            rotation_augmentation=False,  # val不用augmentation
+            rotation_augmentation=False,
             random_angle=False,
             flag_noise=0,
             flag_grid=args.patch_grid,
             num_angle=4,
             dim_grid=args.points_per_patch_dim,
-            num_workers=4,  # val用较少的worker
+            num_workers=4,
             rank=rank,
             world_size=num_gpus
         )
@@ -750,22 +734,21 @@ def train_pipeline(rank, num_gpus, args, config):
             flag_grid=args.patch_grid, 
             num_angle=args.num_angles, 
             dim_grid=args.points_per_patch_dim, 
-            num_workers=4,  # 使用多进程加速数据预处理
+            num_workers=4,
             rank=rank, 
             world_size=num_gpus
         )
-        # Validation data（不使用augmentation）
         val_folder = "data/partial/val" if args.partial else "data/default/val"
         val_data, val_sampler = train_data_loader_clean(
             args.batch_size,
             data_folder=val_folder,
-            rotation_augmentation=False,  # val不用augmentation
+            rotation_augmentation=False,
             random_angle=False,
             flag_noise=0,
             flag_grid=args.patch_grid,
             num_angle=4,
             dim_grid=args.points_per_patch_dim,
-            num_workers=4,  # val用较少的worker
+            num_workers=4,
             rank=rank,
             world_size=num_gpus
         )
@@ -837,12 +820,10 @@ def train_pipeline(rank, num_gpus, args, config):
                 if distribute_sampler is not None:
                     distribute_sampler.set_epoch(cur_epochs)
             
-            # 关键优化：数据已在Dataset中预处理，这里只需移动到GPU
             processed_curves, processed_patches = data_item
             processed_curves = move_to_device(processed_curves, device)
             processed_patches = move_to_device(processed_patches, device)
             
-            # 处理patch
             if processed_patches is not None:
                 try:
                     with autocast() if config.USE_AMP else torch.cuda.amp.autocast(enabled=False):
@@ -885,7 +866,6 @@ def train_pipeline(rank, num_gpus, args, config):
                     if rank == 0:
                         logger.error(f"Runtime error in patch: {e}")
             
-            # 处理curve
             if processed_curves is not None:
                 try:
                     with autocast() if config.USE_AMP else torch.cuda.amp.autocast(enabled=False):
@@ -926,7 +906,6 @@ def train_pipeline(rank, num_gpus, args, config):
                     if rank == 0:
                         logger.error(f"Runtime error in curve: {e}")
             
-            # Optimizer步骤
             if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 if config.USE_AMP:
                     patch_scaler.unscale_(patch_optimizer)
@@ -981,7 +960,6 @@ def train_pipeline(rank, num_gpus, args, config):
             )
             
             if rank == 0 and val_metrics:
-                # 记录validation指标
                 val_log_dict = {"epoch": epoch + 1}
                 if "patch" in val_metrics:
                     val_log_dict["val/patch_recon"] = val_metrics['patch']['recon_error']
@@ -989,7 +967,6 @@ def train_pipeline(rank, num_gpus, args, config):
                     val_log_dict["val/curve_recon"] = val_metrics['curve']['recon_error']
                 wandb.log(val_log_dict)
                 
-                # 保存best model
                 val_loss = val_metrics.get("patch", {}).get("recon_error", 0) + val_metrics.get("curve", {}).get("recon_error", 0)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -1005,7 +982,6 @@ def train_pipeline(rank, num_gpus, args, config):
                     }, os.path.join(args.checkpoint_dir, "best_model.pth"))
                     logger.info(f"Best model saved with val_loss: {val_loss:.6f}")
         
-        # 定期保存checkpoint
         if rank == 0 and (epoch + 1) % config.SAVE_INTERVAL == 0:
             torch.save({
                 "epoch": epoch, 

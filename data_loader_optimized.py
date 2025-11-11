@@ -1,4 +1,3 @@
-# data_loader_optimized.py - 优化版本2（预处理前置）
 import numpy as np
 import os
 import torch
@@ -15,7 +14,6 @@ pack_size = 10000
 th_norm = 1e-6
 points_per_curve_dim = 34
 
-# 从原config中提取的常量
 SCALE_MIN = 1e-4
 SCALE_MAX = 1e2
 LOG_SCALE_MIN = -10.0
@@ -195,14 +193,11 @@ class ABCDatasetOptimized(Dataset):
         return len(self.data)
     
     def _process_curve(self, curve, rot=None):
-        """预处理单个curve - 完全复制process_batch_data_gpu的逻辑"""
         points = curve['points'].astype(np.float32).copy()
         
-        # 应用rotation（如果有）
         if rot is not None:
             points = np.matmul(points, rot).astype(np.float32)
         
-        # Clamp and normalize - 与GPU版本完全一致
         points = np.clip(points, -1000, 1000)
         min_vals = points.min(axis=0)
         max_vals = points.max(axis=0)
@@ -214,7 +209,6 @@ class ABCDatasetOptimized(Dataset):
         normalized_points = (points - center) / scale
         normalized_points = np.clip(normalized_points, -0.6, 0.6).astype(np.float32)
         
-        # 处理endpoints - 与GPU版本逻辑一致
         endpoints = np.zeros((2, 3), dtype=np.float32)
         if not curve['is_closed']:
             endpoint_indices = curve['endpoints']
@@ -237,8 +231,6 @@ class ABCDatasetOptimized(Dataset):
         }
     
     def _process_patch(self, patch, item_points, rot=None):
-        """预处理单个patch - 完全复制process_batch_data_gpu的逻辑"""
-        # 获取patch points和normals
         if not self.flag_grid:
             patch_data = item_points[patch['patch_points']]
             patch_points = patch_data[:, :3].astype(np.float32)
@@ -257,7 +249,6 @@ class ABCDatasetOptimized(Dataset):
             else:
                 return None
         
-        # 应用rotation
         if rot is not None:
             combined = np.concatenate([patch_points, patch_normals], axis=-1).reshape(-1, 3)
             combined = np.dot(combined, rot).astype(np.float32).reshape(-1, 6)
@@ -269,7 +260,6 @@ class ABCDatasetOptimized(Dataset):
         patch_normal_norm[patch_normal_norm < th_norm] = th_norm
         patch_normals = (patch_normals / patch_normal_norm).astype(np.float32)
         
-        # Clamp and normalize points - 与GPU版本完全一致
         patch_points = np.clip(patch_points, -1000, 1000)
         min_vals = patch_points.min(axis=0)
         max_vals = patch_points.max(axis=0)
@@ -295,7 +285,6 @@ class ABCDatasetOptimized(Dataset):
         sample_data = self.data[idx % len(self.data)]
         item_points = sample_data['surface_points'].astype(np.float32).copy()
         
-        # 浅拷贝curves和patches
         curves = [dict(c) for c in sample_data['curves']]
         patches = [dict(p) for p in sample_data['patches']]
 
@@ -335,20 +324,17 @@ class ABCDatasetOptimized(Dataset):
             else:
                 rot = R.random().as_matrix()
             
-            # 对item_points应用rotation
             item_points = np.dot(item_points.reshape(-1, 3), rot).reshape(-1, 6).astype(np.float32)
 
-        # 预处理所有curves
         processed_curves = []
         for curve in curves:
             processed_curve = self._process_curve(curve, rot)
             if processed_curve is not None:
                 processed_curves.append(processed_curve)
         
-        # 预处理所有patches
         processed_patches = []
         for patch in patches:
-            processed_patch = self._process_patch(patch, item_points, None)  # rot已经应用到item_points
+            processed_patch = self._process_patch(patch, item_points, None)
             if processed_patch is not None:
                 processed_patches.append(processed_patch)
         
@@ -357,21 +343,16 @@ class ABCDatasetOptimized(Dataset):
 
 def collate_function_optimized(tensorlist):
     """
-    优化的collate函数 - 直接组装预处理好的数据
-    返回格式与process_batch_data_gpu完全一致
     """
     batch_size = len(tensorlist)
     
-    # 提取curves和patches
     all_curves = [item[0] for item in tensorlist]
     all_patches = [item[1] for item in tensorlist]
     
-    # === 处理Curves ===
     processed_curves = None
     if any(len(curves) > 0 for curves in all_curves):
         max_n_curves = max(len(curves) for curves in all_curves)
         
-        # 初始化tensors
         curve_points_batch = torch.zeros(batch_size, max_n_curves, 34, 3, dtype=torch.float32)
         endpoints_batch = torch.zeros(batch_size, max_n_curves, 2, 3, dtype=torch.float32)
         is_closed_batch = torch.zeros(batch_size, max_n_curves, dtype=torch.bool)
@@ -380,7 +361,6 @@ def collate_function_optimized(tensorlist):
         scale_batch = torch.ones(batch_size, max_n_curves, dtype=torch.float32)
         center_batch = torch.zeros(batch_size, max_n_curves, 3, dtype=torch.float32)
         
-        # 填充数据
         for i, curves in enumerate(all_curves):
             n_curves = len(curves)
             if n_curves > 0:
@@ -405,12 +385,10 @@ def collate_function_optimized(tensorlist):
             "center": center_batch
         }
     
-    # === 处理Patches ===
     processed_patches = None
     if any(len(patches) > 0 for patches in all_patches):
         max_n_patches = max(len(patches) for patches in all_patches)
         
-        # 初始化tensors
         patch_points_batch = torch.zeros(batch_size, max_n_patches, 400, 3, dtype=torch.float32)
         patch_normals_batch = torch.zeros(batch_size, max_n_patches, 400, 3, dtype=torch.float32)
         u_closed_batch = torch.zeros(batch_size, max_n_patches, dtype=torch.bool)
@@ -420,7 +398,6 @@ def collate_function_optimized(tensorlist):
         scale_batch = torch.ones(batch_size, max_n_patches, dtype=torch.float32)
         center_batch = torch.zeros(batch_size, max_n_patches, 3, dtype=torch.float32)
         
-        # 填充数据
         for i, patches in enumerate(all_patches):
             n_patches = len(patches)
             if n_patches > 0:
@@ -428,7 +405,6 @@ def collate_function_optimized(tensorlist):
                     if j >= max_n_patches:
                         break
                     
-                    # 处理不同大小的patch
                     patch_pts = patch['patch_points']
                     patch_norms = patch['patch_normals']
                     
@@ -436,7 +412,6 @@ def collate_function_optimized(tensorlist):
                         patch_points_batch[i, j] = torch.from_numpy(patch_pts)
                         patch_normals_batch[i, j] = torch.from_numpy(patch_norms)
                     elif len(patch_pts) == 100:
-                        # 只使用前100个点（与原逻辑一致）
                         patch_points_batch[i, j, :100] = torch.from_numpy(patch_pts)
                         patch_normals_batch[i, j, :100] = torch.from_numpy(patch_norms)
                     
@@ -502,7 +477,7 @@ def train_data_loader_clean(batch_size=32, data_folder="data/default/train",
             # persistent_workers=(num_workers > 0),
             # prefetch_factor=4 if num_workers > 0 else None,
             drop_last=True,
-            multiprocessing_context='fork' if num_workers > 0 else None  # 使用fork避免内存复制
+            multiprocessing_context='fork' if num_workers > 0 else None
         )
         return train_data, train_sampler
     else:
@@ -516,6 +491,6 @@ def train_data_loader_clean(batch_size=32, data_folder="data/default/train",
             persistent_workers=(num_workers > 0),
             # prefetch_factor=4 if num_workers > 0 else None,
             drop_last=True,
-            multiprocessing_context='fork' if num_workers > 0 else None  # 使用fork避免内存复制
+            multiprocessing_context='fork' if num_workers > 0 else None
         )
         return train_data, None

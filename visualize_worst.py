@@ -23,7 +23,6 @@ curve_type_list = np.array(['Circle', 'BSpline', 'Line', 'Ellipse'])
 patch_type_list = np.array(['Cylinder', 'Torus', 'BSpline', 'Plane', 'Cone', 'Sphere'])
 
 def setup_logger(output_dir, rank=0):
-    """设置日志记录器"""
     if rank != 0:
         return None
     os.makedirs(output_dir, exist_ok=True)
@@ -150,7 +149,6 @@ def write_obj_grouped(filename, vert_groups, face_groups, mtl_groups, group_name
                     f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
 
 def create_default_mtl(mtl_path):
-    """创建默认材质库"""
     with open(mtl_path, 'w') as f:
         f.write("# Default materials\n\n")
         colors = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0),
@@ -164,9 +162,7 @@ def create_default_mtl(mtl_path):
         f.write("newmtl cylinder\nKa 0.3 0.3 0.3\nKd 0.5 0.5 0.5\nKs 0.7 0.7 0.7\nNs 100.0\n\n")
         f.write("newmtl sphere\nKa 1.0 0.8 0.0\nKd 1.0 0.843 0.0\nKs 1.0 1.0 0.5\nNs 200.0\n\n")
 
-# ==================== Corner提取 ====================
 def extract_corners_from_curves(curve_points, is_closed_prob, validity_prob, threshold=0.02):
-    """从开放曲线的端点提取corners并聚类"""
     endpoints = []
     endpoint_to_curve = []
     
@@ -242,7 +238,6 @@ def remove_ddp_prefix(state_dict):
     return {k[7:] if k.startswith('module.') else k: v for k, v in state_dict.items()}
 
 def move_to_device(data_dict, device):
-    """将预处理好的数据移动到GPU"""
     if data_dict is None:
         return None
     return {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v 
@@ -313,10 +308,10 @@ class Visualizer:
                     self.logger.info(f"DEBUG: data_item type: {type(data_item)}")
                     if isinstance(data_item, (tuple, list)):
                         self.logger.info(f"DEBUG: data_item length: {len(data_item)}")
-                        for i, item in enumerate(data_item[:3]):  # 只看前3个元素
+                        for i, item in enumerate(data_item[:3]):
                             self.logger.info(f"DEBUG: data_item[{i}] type: {type(item)}")
                             if isinstance(item, dict):
-                                self.logger.info(f"DEBUG: data_item[{i}] keys: {list(item.keys())[:5]}")  # 只显示前5个key
+                                self.logger.info(f"DEBUG: data_item[{i}] keys: {list(item.keys())[:5]}")
                             elif isinstance(item, torch.Tensor):
                                 self.logger.info(f"DEBUG: data_item[{i}] shape: {item.shape}")
                 
@@ -458,7 +453,6 @@ class Visualizer:
                 self.logger.info(f"Patch Loss - Mean: {np.mean(patch_losses):.6f}, Std: {np.std(patch_losses):.6f}")
 
     def get_worst_samples(self, n=10, sort_by='separate'):
-        """获取重建误差最大的n个样本"""
         if sort_by == 'separate':
             worst_curve = sorted(self.results, key=lambda x: x['curve_loss'], reverse=True)[:n]
             worst_patch = sorted(self.results, key=lambda x: x['patch_loss'], reverse=True)[:n]
@@ -484,7 +478,6 @@ class Visualizer:
             return worst, worst, worst
 
     def get_best_samples(self, n=10, sort_by='separate'):
-        """获取重建误差最小的n个样本"""
         if sort_by == 'separate':
             best_curve = sorted(self.results, key=lambda x: x['curve_loss'])[:n]
             best_patch = sorted(self.results, key=lambda x: x['patch_loss'])[:n]
@@ -510,7 +503,6 @@ class Visualizer:
             return best, best, best
 
     def export_simple_obj(self, result, output_dir, export_pred=True, export_gt=True):
-        """导出OBJ文件用于可视化"""
         sample_id = result['sample_id']
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -577,12 +569,10 @@ class Visualizer:
                 closed_prob = gt['is_closed'][0][valid].cpu().numpy()
                 labels = gt['labels'][0][valid].cpu().numpy()
             
-            # 反归一化
             scale = gt['scale'][0][valid].cpu().numpy()
             center = gt['center'][0][valid].cpu().numpy()
             
             for i, (p, c, l, s, ctr) in enumerate(zip(pts, closed_prob, labels, scale, center)):
-                # 反归一化
                 p_denorm = p * s.reshape(1, 1) + ctr.reshape(1, 3)
                 
                 verts, faces = [], []
@@ -621,7 +611,6 @@ class Visualizer:
                 pts = gt['curve_points'][0][valid].cpu().numpy()
                 closed_prob = gt['is_closed'][0][valid].cpu().numpy()
             
-            # 反归一化
             scale = gt['scale'][0][valid].cpu().numpy()
             center = gt['center'][0][valid].cpu().numpy()
             pts_denorm = pts * scale.reshape(-1, 1, 1) + center.reshape(-1, 1, 3)
@@ -641,7 +630,6 @@ class Visualizer:
         write_obj_grouped(obj_path, allverts, allfaces, allmtl, allnames)
 
     def export_extraction_pickle(self, result, output_dir):
-        """导出用于extraction.py的pickle文件"""
         sample_id = result['sample_id']
         out_path = Path(output_dir) / f"{sample_id}_prediction.pkl"
         
@@ -664,7 +652,6 @@ class Visualizer:
             valid_idx = np.where(gt_mask & (pred_validity > 0.3))[0]
             n_curves = len(valid_idx)
             
-            # 反归一化到原始空间
             scale = gt['scale'][0][valid_idx].cpu().numpy()
             center = gt['center'][0][valid_idx].cpu().numpy()
             pts_norm = pred['points'][0][valid_idx].cpu().numpy()
@@ -698,7 +685,6 @@ class Visualizer:
             valid_idx = np.where(gt_mask & (pred_validity > 0.3))[0]
             n_patches = len(valid_idx)
             
-            # 反归一化
             scale = gt['scale'][0][valid_idx].cpu().numpy()
             center = gt['center'][0][valid_idx].cpu().numpy()
             pts_norm = pred['points'][0][valid_idx].cpu().numpy()
@@ -776,10 +762,8 @@ def main():
     parser.add_argument('--num_workers', type=int, default=4, help='Number of dataloader workers')
     args = parser.parse_args()
 
-    # 分布式初始化
     rank, world_size, local_rank = setup_distributed()
     
-    # 日志设置
     logger = setup_logger(args.output, rank=rank)
     
     if logger:
@@ -792,15 +776,13 @@ def main():
         logger.info(f"Output: {args.output}")
         logger.info(f"Mode: {args.mode}")
     
-    # 加载config和checkpoint
     device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
     checkpoint, config = load_checkpoint_robust(args.checkpoint, device, logger)
     
-    # ==================== 关键修改：使用优化版数据加载器 ====================
     test_data, _ = train_data_loader_clean(
         batch_size=args.batch_size,
         data_folder=args.data,
-        rotation_augmentation=args.rotation_augment,  # validation通常不用augmentation
+        rotation_augmentation=args.rotation_augment,
         random_angle=False,
         flag_noise=0,
         flag_grid=True,
@@ -811,12 +793,10 @@ def main():
         world_size=world_size
     )
     
-    # 评估
     vis = Visualizer(args.checkpoint, config, device, logger=logger, rank=rank)
     vis.evaluate(test_data, max_samples=args.max_eval)
     
     if rank == 0:
-        # ===== 导出Worst样本 =====
         combined_worst, worst_curve, worst_patch = vis.get_worst_samples(
             n=args.n_worst, sort_by=args.sort_by
         )
@@ -848,7 +828,6 @@ def main():
                 logger.info(f"{i:<6} {r['sample_id']:<30} {r['curve_loss']:<12.6f} "
                       f"{r['patch_loss']:<12.6f} {total:<12.6f}")
         
-        # 导出worst
         worst_dir = Path(args.output) / "worst"
         worst_dir.mkdir(parents=True, exist_ok=True)
         
@@ -865,7 +844,6 @@ def main():
                 vis.export_extraction_pickle(r, worst_dir)
             logger.info(f"✓ Done! Next: python extraction.py --folder {worst_dir} --type 1")
         
-        # ===== 导出Best样本 =====
         if args.export_best:
             combined_best, best_curve, best_patch = vis.get_best_samples(
                 n=args.n_best, sort_by=args.sort_by
@@ -898,7 +876,6 @@ def main():
                     logger.info(f"{i:<6} {r['sample_id']:<30} {r['curve_loss']:<12.6f} "
                           f"{r['patch_loss']:<12.6f} {total:<12.6f}")
             
-            # 导出best
             best_dir = Path(args.output) / "best"
             best_dir.mkdir(parents=True, exist_ok=True)
             
