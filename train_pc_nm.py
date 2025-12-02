@@ -708,7 +708,7 @@ def val_pipeline(patch_encoder, patch_decoder, curve_encoder, curve_decoder,
     return val_metrics
 
 def train_pipeline(rank, num_gpus, args, config):
-    dist.init_process_group(backend="nccl", init_method="tcp://127.0.0.1:23257", world_size=num_gpus, rank=rank)
+    dist.init_process_group(backend="nccl", init_method="tcp://127.0.0.1:23259", world_size=num_gpus, rank=rank)
     if num_gpus > 1:
         torch.cuda.set_device(rank)
         device = f"cuda:{rank}"

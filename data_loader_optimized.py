@@ -1,3 +1,4 @@
+# data_loader_global_topology.py - 全局拓扑处理的数据加载器（内存优化版）
 import numpy as np
 import os
 import torch
@@ -5,6 +6,7 @@ import math
 from scipy.spatial.transform import Rotation as R
 import pickle
 import random
+import gc
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import Dataset, DataLoader
 
@@ -14,6 +16,7 @@ pack_size = 10000
 th_norm = 1e-6
 points_per_curve_dim = 34
 
+# 常量
 SCALE_MIN = 1e-4
 SCALE_MAX = 1e2
 LOG_SCALE_MIN = -10.0
@@ -25,6 +28,7 @@ def pack_pickle_files(data_folder, packed_data_folder):
     files = os.listdir(data_folder)
     random.shuffle(files)
     file_count = 0
+    packed_file = None
     for file in files:
         if file.endswith(".pkl"):
             file_count += 1
@@ -36,134 +40,193 @@ def pack_pickle_files(data_folder, packed_data_folder):
                 pickle.dump(sample, packed_file)
             if file_count % pack_size == 0:
                 packed_file.close()
-    if not packed_file.closed:
+                packed_file = None
+    if packed_file is not None and not packed_file.closed:
         packed_file.close()
 
-def data_loader_ABC(data_folder):
-    """Load ABC dataset"""
-    def curve_type_to_id(str):
-        if str == 'Circle': return 0
-        if str == 'BSpline': return 1
-        if str == 'Line': return 2
-        return 3  # Ellipse
+
+def _curve_type_to_id(s):
+    """曲线类型转ID"""
+    return {'Circle': 0, 'BSpline': 1, 'Line': 2}.get(s, 3)
+
+def _patch_type_to_id(s):
+    """面片类型转ID"""
+    mapping = {'Cylinder': 0, 'Torus': 1, 'BSpline': 2, 'Extrusion': 2, 
+               'Revolution': 2, 'Plane': 3, 'Cone': 4, 'Sphere': 5}
+    return mapping.get(s, 5)
+
+
+class LazyDataIndex:
+    """惰性数据索引 - 只存储文件位置信息，不加载实际数据"""
+    __slots__ = ['packed_file', 'offset', 'length']
     
-    def patch_type_to_id(str):
-        if str == 'Cylinder': return 0
-        if str == 'Torus': return 1
-        if str in ['BSpline', 'Extrusion', 'Revolution']: return 2
-        if str == 'Plane': return 3
-        if str == 'Cone': return 4
-        return 5  # Sphere
-    
-    sample_list = []
-    print(f"Loading data from {data_folder}")
+    def __init__(self, packed_file, offset, length):
+        self.packed_file = packed_file
+        self.offset = offset
+        self.length = length
+
+
+def build_lazy_index(data_folder):
+    """构建惰性索引，只扫描文件位置"""
+    print(f"Building lazy index from {data_folder}")
     
     if os.path.exists(os.path.join(data_folder, "packed")):
-        print("Using packed pkl files")
-        read_from_packed_pkl = True
         data_folder = os.path.join(data_folder, "packed")
+        read_from_packed = True
     else:
-        read_from_packed_pkl = False
+        read_from_packed = False
     
+    index_list = []
     curve_length_stat = []
     patch_area_stat = []
-    
-    files = os.listdir(data_folder)
-    file_count = 0
+    files = sorted(os.listdir(data_folder))
     
     for file in files:
         if not file.endswith(".pkl"):
             continue
         
-        with open(os.path.join(data_folder, file), "rb") as rf:
-            while True:
-                try:
-                    sample = pickle.load(rf)
-                except EOFError:
-                    break
-                
-                if read_from_packed_pkl:
-                    file = sample['filename']
-                
-                file_count += 1
-                processed_sample = {}
-                processed_sample['surface_points'] = sample['surface_points']
-                scale = 1.0
-                translation = np.zeros(3)
-                
-                if processed_sample['surface_points'][:,:3].min() < -0.55 or processed_sample['surface_points'][:,:3].max() > 0.55:
-                    continue
-                
-                processed_sample['curves'] = []
-                
-                if len(sample['curves']) == 0:
-                    continue
-                
-                short_curves = False
-                for curve_idx, curve in enumerate(sample['curves']):
-                    processed_curve = {}
-                    processed_curve['points'] = scale * (curve['points'] + translation)
+        filepath = os.path.join(data_folder, file)
+        
+        if read_from_packed:
+            # 对于packed文件，需要记录每个sample的位置
+            with open(filepath, "rb") as rf:
+                while True:
+                    offset = rf.tell()
+                    try:
+                        sample = pickle.load(rf)
+                    except EOFError:
+                        break
                     
-                    if processed_curve['points'].min() < -0.55 or processed_curve['points'].max() > 0.55:
+                    # 快速验证sample有效性
+                    if not _validate_sample_quick(sample):
                         continue
                     
-                    processed_curve['is_closed'] = curve['is_closed']
+                    length = rf.tell() - offset
+                    index_list.append(LazyDataIndex(filepath, offset, length))
                     
-                    if not curve['is_closed']:
-                        processed_curve['endpoints'] = [curve['start_vert_idx'], curve['end_vert_idx']]
-                    else:
-                        processed_curve['endpoints'] = [-1, -1]
-                    
-                    processed_curve['type'] = curve_type_to_id(curve['type'])
-                    processed_curve['curve_length'] = curve['curve_length'] * scale
-                    
-                    if processed_curve['curve_length'] < 1e-3:
-                        short_curves = True
-                    else:
-                        curve_length_stat.append(processed_curve['curve_length'])
-                    
-                    processed_sample['curves'].append(processed_curve)
-                
-                if short_curves:
-                    continue
-                
-                processed_sample['patches'] = []
-                for patch in sample['patches']:
-                    processed_patch = {}
-                    processed_patch['type'] = patch_type_to_id(patch['type'])
-                    processed_patch['patch_points'] = patch['patch_points']
-                    
-                    if 'grid_normal' in patch:
-                        processed_patch['grid_normal'] = patch['grid_normal']
-                    if 'u_closed' in patch:
-                        processed_patch['u_closed'] = patch['u_closed']
-                    if 'v_closed' in patch:
-                        processed_patch['v_closed'] = patch['v_closed']
-                    
-                    processed_patch['patch_area'] = patch['patch_area'] * scale * scale
-                    patch_area_stat.append(processed_patch['patch_area'])
-                    processed_sample['patches'].append(processed_patch)
-                
-                sample_list.append(processed_sample)
+                    # 统计信息（轻量级）
+                    for curve in sample.get('curves', []):
+                        if curve.get('curve_length', 0) >= 1e-3:
+                            curve_length_stat.append(curve['curve_length'])
+                    for patch in sample.get('patches', []):
+                        patch_area_stat.append(patch.get('patch_area', 0))
+        else:
+            # 单个文件直接索引
+            index_list.append(LazyDataIndex(filepath, 0, -1))
     
-    print(f"Loaded {len(sample_list)} samples from {file_count} files")
-    
-    curve_length_stat = np.square(np.array(curve_length_stat))
-    patch_area_stat = np.array(patch_area_stat)
-    
+    # 计算全局统计
     global average_patch_area, average_squared_curve_length
-    average_patch_area = patch_area_stat.mean()
-    average_squared_curve_length = curve_length_stat.mean()
+    if curve_length_stat:
+        average_squared_curve_length = np.mean(np.square(curve_length_stat))
+    if patch_area_stat:
+        average_patch_area = np.mean(patch_area_stat)
     
-    return sample_list
+    print(f"Built lazy index with {len(index_list)} samples")
+    gc.collect()
+    
+    return index_list, data_folder
+
+
+def _validate_sample_quick(sample):
+    """快速验证样本有效性"""
+    if 'surface_points' not in sample:
+        return False
+    pts = sample['surface_points']
+    if pts[:, :3].min() < -0.55 or pts[:, :3].max() > 0.55:
+        return False
+    if len(sample.get('curves', [])) == 0:
+        return False
+    # 检查是否有过短的曲线
+    for curve in sample.get('curves', []):
+        if curve.get('curve_length', 0) < 1e-3:
+            return False
+    return True
+
+
+def load_and_process_sample(index_item):
+    """按需加载并处理单个样本"""
+    with open(index_item.packed_file, "rb") as rf:
+        if index_item.offset > 0:
+            rf.seek(index_item.offset)
+        sample = pickle.load(rf)
+    
+    # 轻量级处理
+    processed = {
+        'surface_points': sample['surface_points'].astype(np.float32),
+        'curves': [],
+        'patches': []
+    }
+    
+    scale = 1.0
+    translation = np.zeros(3, dtype=np.float32)
+    
+    for curve in sample.get('curves', []):
+        pts = curve['points']
+        if pts.min() < -0.55 or pts.max() > 0.55:
+            continue
+        
+        processed['curves'].append({
+            'points': (scale * (pts + translation)).astype(np.float32),
+            'is_closed': curve['is_closed'],
+            'endpoints': [-1, -1] if curve['is_closed'] else [curve['start_vert_idx'], curve['end_vert_idx']],
+            'type': _curve_type_to_id(curve['type']),
+            'curve_length': curve['curve_length'] * scale
+        })
+    
+    for patch in sample.get('patches', []):
+        processed['patches'].append({
+            'type': _patch_type_to_id(patch['type']),
+            'patch_points': patch['patch_points'],
+            'curves': patch['curves'],
+            'grid_normal': patch.get('grid_normal'),
+            'u_closed': patch.get('u_closed', False),
+            'v_closed': patch.get('v_closed', False),
+            'patch_area': patch.get('patch_area', 0) * scale * scale
+        })
+    
+    return processed
+
+
+# 预计算旋转矩阵（模块级别，避免重复计算）
+_ROTATION_MATRICES = None
+
+def _get_rotation_matrices():
+    """获取预计算的旋转矩阵"""
+    global _ROTATION_MATRICES
+    if _ROTATION_MATRICES is None:
+        mats = []
+        for i in range(4):
+            mats.append(R.from_rotvec(np.pi/2 * i * np.array([0,1,0])).as_matrix().astype(np.float32))
+        mats.append(R.from_rotvec(np.pi/2 * 1 * np.array([1,0,0])).as_matrix().astype(np.float32))
+        mats.append(R.from_rotvec(np.pi/2 * 3 * np.array([1,0,0])).as_matrix().astype(np.float32))
+        
+        c, s = np.sqrt(3)/3, -np.sqrt(6)/3
+        cornerrot1 = np.array([[c,0,-s],[0,1,0],[s,0,c]], dtype=np.float32)
+        for i in range(4):
+            rot = np.matmul(R.from_rotvec((np.pi/2 * i + np.pi/4) * np.array([0,0,1])).as_matrix(), cornerrot1)
+            mats.append(rot.T.astype(np.float32))
+        
+        c = -np.sqrt(3)/3
+        cornerrot2 = np.array([[c,0,-s],[0,1,0],[s,0,c]], dtype=np.float32)
+        for i in range(4):
+            rot = np.matmul(R.from_rotvec((np.pi/2 * i + np.pi/4) * np.array([0,0,1])).as_matrix(), cornerrot2)
+            mats.append(rot.T.astype(np.float32))
+        
+        _ROTATION_MATRICES = mats
+    return _ROTATION_MATRICES
+
 
 flag_normal_noise = True
 r_normal_noise = 0.2
 
+
 class ABCDatasetOptimized(Dataset):
-    def __init__(self, data, random_rotation=False, random_angle=False, flag_noise=0, 
-                 flag_grid=False, num_angles=4, dim_grid=10):
-        self.data = data
+    """内存优化的数据集 - 惰性加载"""
+    
+    def __init__(self, data_folder, random_rotation=False, random_angle=False, 
+                 flag_noise=0, flag_grid=False, num_angles=4, dim_grid=10):
+        # 构建惰性索引而不是加载所有数据
+        self.index_list, self.data_folder = build_lazy_index(data_folder)
         self.random_rotation_augmentation = random_rotation
         self.random_angle = random_angle
         self.flag_noise = flag_noise
@@ -171,199 +234,185 @@ class ABCDatasetOptimized(Dataset):
         self.num_angles = num_angles
         self.dim_grid = dim_grid
         
-        # Pre-compute rotation matrices
-        self.fourteen_mat = []
-        for i in range(4):
-            self.fourteen_mat.append(R.from_rotvec(np.pi/2 * i * np.array([0,1,0])).as_matrix())
-        self.fourteen_mat.append(R.from_rotvec(np.pi/2 * 1 * np.array([1,0,0])).as_matrix())
-        self.fourteen_mat.append(R.from_rotvec(np.pi/2 * 3 * np.array([1,0,0])).as_matrix())
-        
-        c = np.sqrt(3)/3
-        s = -np.sqrt(6)/3
-        cornerrot1 = np.array([[c,0,-s],[0,1,0],[s,0,c]])
-        for i in range(4):
-            self.fourteen_mat.append(np.matmul(R.from_rotvec((np.pi/2 * i + np.pi / 4) * np.array([0,0,1])).as_matrix(), cornerrot1).transpose())
-        
-        c = -np.sqrt(3)/3
-        cornerrot2 = np.array([[c,0,-s],[0,1,0],[s,0,c]])
-        for i in range(4):
-            self.fourteen_mat.append(np.matmul(R.from_rotvec((np.pi/2 * i + np.pi / 4) * np.array([0,0,1])).as_matrix(), cornerrot2).transpose())
+        # 预计算旋转矩阵
+        self.rotation_matrices = _get_rotation_matrices()
     
     def __len__(self):
-        return len(self.data)
+        return len(self.index_list)
+    
+    def _get_rotation(self):
+        """获取随机旋转矩阵"""
+        if not self.random_rotation_augmentation:
+            return None
+        
+        if not self.random_angle:
+            if self.num_angles == 4:
+                return R.from_rotvec(np.pi/2 * random.randint(0,3) * np.array([0,0,1])).as_matrix().astype(np.float32)
+            elif self.num_angles == 56:
+                rot = self.rotation_matrices[random.randint(0, 13)]
+                rot_z = R.from_rotvec(np.pi/2 * random.randint(0,3) * np.array([0,0,1])).as_matrix()
+                return np.matmul(rot_z, rot).astype(np.float32)
+            elif self.num_angles == 14:
+                return self.rotation_matrices[random.randint(0, 13)]
+            else:
+                angle = random.random() * 2 * np.pi
+                c, s = np.cos(angle), np.sin(angle)
+                return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float32)
+        else:
+            return R.random().as_matrix().astype(np.float32)
     
     def _process_curve(self, curve, rot=None):
-        points = curve['points'].astype(np.float32).copy()
+        """处理单个curve - 原地操作减少内存"""
+        points = curve['points']  # 不复制
         
         if rot is not None:
-            points = np.matmul(points, rot).astype(np.float32)
+            points = np.dot(points, rot)
         
-        points = np.clip(points, -1000, 1000)
+        np.clip(points, -1000, 1000, out=points)
         min_vals = points.min(axis=0)
         max_vals = points.max(axis=0)
-        extent = max_vals - min_vals
-        scale = float(extent.max())
-        scale = np.clip(scale, SCALE_MIN, SCALE_MAX)
-        center = (min_vals + max_vals) / 2.0
+        scale = float((max_vals - min_vals).max())
+        scale = max(SCALE_MIN, min(SCALE_MAX, scale))
+        center = (min_vals + max_vals) * 0.5
         
-        normalized_points = (points - center) / scale
-        normalized_points = np.clip(normalized_points, -0.6, 0.6).astype(np.float32)
+        normalized = (points - center) / scale
+        np.clip(normalized, -0.6, 0.6, out=normalized)
         
         endpoints = np.zeros((2, 3), dtype=np.float32)
         if not curve['is_closed']:
-            endpoint_indices = curve['endpoints']
-            if isinstance(endpoint_indices, (list, tuple, np.ndarray)):
-                idx0, idx1 = int(endpoint_indices[0]), int(endpoint_indices[1])
-            else:
-                idx0, idx1 = int(endpoint_indices), int(endpoint_indices)
-            idx0 = max(0, min(33, idx0))
-            idx1 = max(0, min(33, idx1))
-            endpoints[0] = normalized_points[idx0]
-            endpoints[1] = normalized_points[idx1]
+            ep = curve['endpoints']
+            idx0 = max(0, min(33, int(ep[0]) if isinstance(ep, (list, tuple, np.ndarray)) else int(ep)))
+            idx1 = max(0, min(33, int(ep[1]) if isinstance(ep, (list, tuple, np.ndarray)) else int(ep)))
+            endpoints[0] = normalized[idx0]
+            endpoints[1] = normalized[idx1]
         
         return {
-            'curve_points': normalized_points,
+            'curve_points': normalized.astype(np.float32),
             'endpoints': endpoints,
             'is_closed': bool(curve['is_closed']),
             'label': int(curve['type']),
-            'scale': scale,
-            'center': center
+            'scale': float(scale),
+            'center': center.astype(np.float32)
         }
     
     def _process_patch(self, patch, item_points, rot=None):
+        """处理单个patch - 原地操作减少内存"""
         if not self.flag_grid:
             patch_data = item_points[patch['patch_points']]
-            patch_points = patch_data[:, :3].astype(np.float32)
-            patch_normals = patch_data[:, 3:].astype(np.float32)
+            patch_points = patch_data[:, :3]
+            patch_normals = patch_data[:, 3:]
         else:
-            if 'grid_normal' in patch:
-                grid_data = patch['grid_normal']
-                if len(grid_data) == self.dim_grid * self.dim_grid:
-                    patch_points = grid_data[:, :3].astype(np.float32)
-                    patch_normals = grid_data[:, 3:].astype(np.float32)
-                else:
-                    tmp = grid_data.reshape(20, 20, -1)
-                    tmp = tmp[::2, ::2].reshape(-1, 6)
-                    patch_points = tmp[:, :3].astype(np.float32)
-                    patch_normals = tmp[:, 3:].astype(np.float32)
-            else:
+            grid_data = patch.get('grid_normal')
+            if grid_data is None:
                 return None
+            
+            if len(grid_data) == self.dim_grid * self.dim_grid:
+                patch_points = grid_data[:, :3]
+                patch_normals = grid_data[:, 3:]
+            else:
+                tmp = grid_data.reshape(20, 20, -1)[::2, ::2].reshape(-1, 6)
+                patch_points = tmp[:, :3]
+                patch_normals = tmp[:, 3:]
         
         if rot is not None:
-            combined = np.concatenate([patch_points, patch_normals], axis=-1).reshape(-1, 3)
-            combined = np.dot(combined, rot).astype(np.float32).reshape(-1, 6)
-            patch_points = combined[:, :3]
-            patch_normals = combined[:, 3:]
+            patch_points = np.dot(patch_points, rot)
+            patch_normals = np.dot(patch_normals, rot)
         
-        # Normalize patch normals
-        patch_normal_norm = np.linalg.norm(patch_normals, axis=-1, keepdims=True)
-        patch_normal_norm[patch_normal_norm < th_norm] = th_norm
-        patch_normals = (patch_normals / patch_normal_norm).astype(np.float32)
+        # 归一化法向量 - 原地操作
+        norm = np.linalg.norm(patch_normals, axis=-1, keepdims=True)
+        norm = np.maximum(norm, th_norm)
+        patch_normals = patch_normals / norm
         
-        patch_points = np.clip(patch_points, -1000, 1000)
+        np.clip(patch_points, -1000, 1000, out=patch_points)
         min_vals = patch_points.min(axis=0)
         max_vals = patch_points.max(axis=0)
-        extent = max_vals - min_vals
-        scale = float(extent.max())
-        scale = np.clip(scale, SCALE_MIN, SCALE_MAX)
-        center = (min_vals + max_vals) / 2.0
+        scale = float((max_vals - min_vals).max())
+        scale = max(SCALE_MIN, min(SCALE_MAX, scale))
+        center = (min_vals + max_vals) * 0.5
         
-        normalized_points = (patch_points - center) / scale
-        normalized_points = np.clip(normalized_points, -0.6, 0.6).astype(np.float32)
+        normalized = (patch_points - center) / scale
+        np.clip(normalized, -0.6, 0.6, out=normalized)
         
         return {
-            'patch_points': normalized_points,
-            'patch_normals': patch_normals,
+            'patch_points': normalized.astype(np.float32),
+            'patch_normals': patch_normals.astype(np.float32),
             'u_closed': bool(patch.get('u_closed', False)),
             'v_closed': bool(patch.get('v_closed', False)),
             'label': int(patch['type']),
-            'scale': scale,
-            'center': center
+            'curves': patch.get('curves', []),
+            'scale': float(scale),
+            'center': center.astype(np.float32)
         }
     
     def __getitem__(self, idx):
-        sample_data = self.data[idx % len(self.data)]
-        item_points = sample_data['surface_points'].astype(np.float32).copy()
+        # 惰性加载样本
+        sample_data = load_and_process_sample(self.index_list[idx % len(self.index_list)])
+        item_points = sample_data['surface_points']
         
-        curves = [dict(c) for c in sample_data['curves']]
-        patches = [dict(p) for p in sample_data['patches']]
-
-        # Add noise if requested
+        # 添加噪声
         if self.flag_noise > 0:
             sigma = {1: 0.01, 2: 0.02, 3: 0.05}[self.flag_noise]
             clip = 5.0 * sigma
-            jittered_data_pts = np.clip(sigma * np.random.randn(item_points.shape[0], 3), -clip, clip)
-            item_points[:,:3] += jittered_data_pts
+            noise = np.clip(sigma * np.random.randn(item_points.shape[0], 3), -clip, clip).astype(np.float32)
+            item_points[:, :3] += noise
             
             if flag_normal_noise:
-                normal_noise = np.random.random_sample((item_points.shape[0], 3)) * 2 - 1
-                normal_noise_norm = np.linalg.norm(normal_noise, axis=-1).reshape(-1, 1)
-                normal_noise_norm[normal_noise_norm < th_norm] = th_norm
-                normal_noise = normal_noise / normal_noise_norm
-                new_normal = item_points[:,3:] + normal_noise * r_normal_noise
-                new_normal_norm = np.linalg.norm(new_normal, axis=-1).reshape(-1, 1)
-                new_normal_norm[new_normal_norm < th_norm] = th_norm
-                item_points[:, 3:] = new_normal / new_normal_norm
-
-        # Rotation augmentation
-        rot = None
-        if self.random_rotation_augmentation:
-            if not self.random_angle:
-                if self.num_angles == 4:
-                    rot = R.from_rotvec(np.pi/2 * random.randint(0,3) * np.array([0,0,1])).as_matrix()
-                elif self.num_angles == 56:
-                    rot = self.fourteen_mat[random.randint(0,13)]
-                    rot_z = R.from_rotvec(np.pi/2 * random.randint(0,3) * np.array([0,0,1])).as_matrix()
-                    rot = np.matmul(rot_z, rot)
-                elif self.num_angles == 14:
-                    rot = self.fourteen_mat[random.randint(0,13)]
-                else:  # -1
-                    rotation_angle = np.random.uniform() * 2 * np.pi
-                    cosval, sinval = np.cos(rotation_angle), np.sin(rotation_angle)
-                    rot = np.array([[cosval, 0, sinval], [0, 1, 0], [-sinval, 0, cosval]])
-            else:
-                rot = R.random().as_matrix()
-            
-            item_points = np.dot(item_points.reshape(-1, 3), rot).reshape(-1, 6).astype(np.float32)
-
+                normal_noise = (np.random.random((item_points.shape[0], 3)) * 2 - 1).astype(np.float32)
+                norm = np.linalg.norm(normal_noise, axis=-1, keepdims=True)
+                norm = np.maximum(norm, th_norm)
+                normal_noise /= norm
+                new_normal = item_points[:, 3:] + normal_noise * r_normal_noise
+                norm = np.linalg.norm(new_normal, axis=-1, keepdims=True)
+                norm = np.maximum(norm, th_norm)
+                item_points[:, 3:] = new_normal / norm
+        
+        # 旋转增强
+        rot = self._get_rotation()
+        if rot is not None:
+            item_points = np.dot(item_points.reshape(-1, 3), rot).reshape(-1, 6)
+        
+        # 处理curves和patches
         processed_curves = []
-        for curve in curves:
-            processed_curve = self._process_curve(curve, rot)
-            if processed_curve is not None:
-                processed_curves.append(processed_curve)
+        for curve in sample_data['curves']:
+            pc = self._process_curve(curve, rot)
+            if pc is not None:
+                processed_curves.append(pc)
         
         processed_patches = []
-        for patch in patches:
-            processed_patch = self._process_patch(patch, item_points, None)
-            if processed_patch is not None:
-                processed_patches.append(processed_patch)
+        for patch in sample_data['patches']:
+            pp = self._process_patch(patch, item_points, None)
+            if pp is not None:
+                processed_patches.append(pp)
         
         return (processed_curves, processed_patches)
 
 
-def collate_function_optimized(tensorlist):
+def collate_function_global_topology(batch_list):
     """
+    全局拓扑处理的collate函数 - 内存优化版
     """
-    batch_size = len(tensorlist)
+    batch_size = len(batch_list)
     
-    all_curves = [item[0] for item in tensorlist]
-    all_patches = [item[1] for item in tensorlist]
+    all_curves = [item[0] for item in batch_list]
+    all_patches = [item[1] for item in batch_list]
     
+    # === Step 1: 收集curves数据 ===
     processed_curves = None
-    if any(len(curves) > 0 for curves in all_curves):
-        max_n_curves = max(len(curves) for curves in all_curves)
-        
-        curve_points_batch = torch.zeros(batch_size, max_n_curves, 34, 3, dtype=torch.float32)
-        endpoints_batch = torch.zeros(batch_size, max_n_curves, 2, 3, dtype=torch.float32)
-        is_closed_batch = torch.zeros(batch_size, max_n_curves, dtype=torch.bool)
-        labels_batch = torch.zeros(batch_size, max_n_curves, dtype=torch.long)
-        mask_batch = torch.zeros(batch_size, max_n_curves, dtype=torch.bool)
-        scale_batch = torch.ones(batch_size, max_n_curves, dtype=torch.float32)
-        center_batch = torch.zeros(batch_size, max_n_curves, 3, dtype=torch.float32)
-        
-        for i, curves in enumerate(all_curves):
-            n_curves = len(curves)
-            if n_curves > 0:
+    valid_curves = [c for c in all_curves if len(c) > 0]
+    
+    if valid_curves:
+        max_n_curves = max(len(c) for c in all_curves)
+        if max_n_curves > 0:
+            # 预分配tensor
+            curve_points_batch = torch.zeros(batch_size, max_n_curves, 34, 3, dtype=torch.float32)
+            endpoints_batch = torch.zeros(batch_size, max_n_curves, 2, 3, dtype=torch.float32)
+            is_closed_batch = torch.zeros(batch_size, max_n_curves, dtype=torch.bool)
+            labels_batch = torch.zeros(batch_size, max_n_curves, dtype=torch.long)
+            mask_batch = torch.zeros(batch_size, max_n_curves, dtype=torch.bool)
+            scale_batch = torch.ones(batch_size, max_n_curves, dtype=torch.float32)
+            center_batch = torch.zeros(batch_size, max_n_curves, 3, dtype=torch.float32)
+            
+            for i, curves in enumerate(all_curves):
                 for j, curve in enumerate(curves):
                     if j >= max_n_curves:
                         break
@@ -371,76 +420,91 @@ def collate_function_optimized(tensorlist):
                     endpoints_batch[i, j] = torch.from_numpy(curve['endpoints'])
                     is_closed_batch[i, j] = curve['is_closed']
                     labels_batch[i, j] = curve['label']
-                    scale_batch[i, j] = curve['scale']
-                    center_batch[i, j] = torch.from_numpy(curve['center'])
+                    scale_batch[i, j] = float(curve['scale'])
+                    center_batch[i, j] = torch.from_numpy(np.asarray(curve['center'], dtype=np.float32))
                     mask_batch[i, j] = True
-        
-        processed_curves = {
-            "curve_points": curve_points_batch,
-            "endpoints": endpoints_batch,
-            "is_closed": is_closed_batch,
-            "labels": labels_batch,
-            "mask": mask_batch,
-            "scale": scale_batch,
-            "center": center_batch
-        }
+            
+            processed_curves = {
+                "curve_points": curve_points_batch,
+                "endpoints": endpoints_batch,
+                "is_closed": is_closed_batch,
+                "labels": labels_batch,
+                "mask": mask_batch,
+                "scale": scale_batch,
+                "center": center_batch
+            }
     
+    # === Step 2: 收集patches数据 ===
     processed_patches = None
-    if any(len(patches) > 0 for patches in all_patches):
-        max_n_patches = max(len(patches) for patches in all_patches)
-        
-        patch_points_batch = torch.zeros(batch_size, max_n_patches, 400, 3, dtype=torch.float32)
-        patch_normals_batch = torch.zeros(batch_size, max_n_patches, 400, 3, dtype=torch.float32)
-        u_closed_batch = torch.zeros(batch_size, max_n_patches, dtype=torch.bool)
-        v_closed_batch = torch.zeros(batch_size, max_n_patches, dtype=torch.bool)
-        labels_batch = torch.zeros(batch_size, max_n_patches, dtype=torch.long)
-        mask_batch = torch.zeros(batch_size, max_n_patches, dtype=torch.bool)
-        scale_batch = torch.ones(batch_size, max_n_patches, dtype=torch.float32)
-        center_batch = torch.zeros(batch_size, max_n_patches, 3, dtype=torch.float32)
-        
-        for i, patches in enumerate(all_patches):
-            n_patches = len(patches)
-            if n_patches > 0:
+    valid_patches = [p for p in all_patches if len(p) > 0]
+    
+    if valid_patches:
+        max_n_patches = max(len(p) for p in all_patches)
+        if max_n_patches > 0:
+            # 确定patch点数
+            first_patch = valid_patches[0][0] if valid_patches[0] else None
+            n_patch_pts = 100 if first_patch and len(first_patch['patch_points']) <= 100 else 400
+            
+            patch_points_batch = torch.zeros(batch_size, max_n_patches, n_patch_pts, 3, dtype=torch.float32)
+            patch_normals_batch = torch.zeros(batch_size, max_n_patches, n_patch_pts, 3, dtype=torch.float32)
+            u_closed_batch = torch.zeros(batch_size, max_n_patches, dtype=torch.bool)
+            v_closed_batch = torch.zeros(batch_size, max_n_patches, dtype=torch.bool)
+            labels_batch = torch.zeros(batch_size, max_n_patches, dtype=torch.long)
+            mask_batch = torch.zeros(batch_size, max_n_patches, dtype=torch.bool)
+            scale_batch = torch.ones(batch_size, max_n_patches, dtype=torch.float32)
+            center_batch = torch.zeros(batch_size, max_n_patches, 3, dtype=torch.float32)
+            patches_curves_info = []
+            
+            for i, patches in enumerate(all_patches):
+                batch_patches_curves = []
                 for j, patch in enumerate(patches):
                     if j >= max_n_patches:
                         break
                     
-                    patch_pts = patch['patch_points']
-                    patch_norms = patch['patch_normals']
+                    pts = patch['patch_points']
+                    norms = patch['patch_normals']
+                    n_pts = min(len(pts), n_patch_pts)
                     
-                    if len(patch_pts) == 400:
-                        patch_points_batch[i, j] = torch.from_numpy(patch_pts)
-                        patch_normals_batch[i, j] = torch.from_numpy(patch_norms)
-                    elif len(patch_pts) == 100:
-                        patch_points_batch[i, j, :100] = torch.from_numpy(patch_pts)
-                        patch_normals_batch[i, j, :100] = torch.from_numpy(patch_norms)
-                    
+                    patch_points_batch[i, j, :n_pts] = torch.from_numpy(pts[:n_pts])
+                    patch_normals_batch[i, j, :n_pts] = torch.from_numpy(norms[:n_pts])
                     u_closed_batch[i, j] = patch['u_closed']
                     v_closed_batch[i, j] = patch['v_closed']
                     labels_batch[i, j] = patch['label']
-                    scale_batch[i, j] = patch['scale']
-                    center_batch[i, j] = torch.from_numpy(patch['center'])
+                    scale_batch[i, j] = float(patch['scale'])
+                    center_batch[i, j] = torch.from_numpy(np.asarray(patch['center'], dtype=np.float32))
                     mask_batch[i, j] = True
-        
-        processed_patches = {
-            "patch_points": patch_points_batch,
-            "patch_normals": patch_normals_batch,
-            "u_closed": u_closed_batch,
-            "v_closed": v_closed_batch,
-            "labels": labels_batch,
-            "mask": mask_batch,
-            "scale": scale_batch,
-            "center": center_batch
-        }
+                    batch_patches_curves.append(patch.get('curves', []))
+                
+                patches_curves_info.append(batch_patches_curves)
+            
+            processed_patches = {
+                "patch_points": patch_points_batch,
+                "patch_normals": patch_normals_batch,
+                "u_closed": u_closed_batch,
+                "v_closed": v_closed_batch,
+                "labels": labels_batch,
+                "mask": mask_batch,
+                "scale": scale_batch,
+                "center": center_batch,
+                "curves_info": patches_curves_info
+            }
     
     return (processed_curves, processed_patches)
+
+
+def data_loader_ABC(data_folder):
+    """兼容接口 - 返回惰性索引列表"""
+    index_list, _ = build_lazy_index(data_folder)
+    return index_list
 
 
 def train_data_loader_clean(batch_size=32, data_folder="data/default/train", 
                             rotation_augmentation=False, random_angle=False, 
                             flag_noise=0, flag_grid=False, num_angle=4, dim_grid=10,
                             num_workers=8, rank=0, world_size=1):
-    # Pack pickle files if needed
+    """
+    带全局拓扑处理的数据加载器 - 内存优化版
+    """
     if not os.path.exists(os.path.join(data_folder, "packed")):
         if rank == 0:
             os.makedirs(os.path.join(data_folder, "packed"), exist_ok=True)
@@ -450,7 +514,7 @@ def train_data_loader_clean(batch_size=32, data_folder="data/default/train",
             dist.barrier()
     
     train_dataset = ABCDatasetOptimized(
-        data_loader_ABC(data_folder),
+        data_folder,
         random_rotation=rotation_augmentation,
         random_angle=random_angle,
         flag_noise=flag_noise,
@@ -459,38 +523,23 @@ def train_data_loader_clean(batch_size=32, data_folder="data/default/train",
         dim_grid=dim_grid
     )
     
+    # 减少num_workers以降低内存使用
+    effective_workers = min(num_workers, 2)
+    
     if world_size > 1:
         train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-            drop_last=True
+            train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
         )
         train_data = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            collate_fn=collate_function_optimized,
-            sampler=train_sampler,
-            num_workers=num_workers,
-            pin_memory=True,
-            # persistent_workers=(num_workers > 0),
-            # prefetch_factor=4 if num_workers > 0 else None,
-            drop_last=True,
-            multiprocessing_context='fork' if num_workers > 0 else None
+            train_dataset, batch_size=batch_size, collate_fn=collate_function_global_topology,
+            sampler=train_sampler, num_workers=effective_workers, pin_memory=False,
+            drop_last=True, persistent_workers=False
         )
         return train_data, train_sampler
     else:
         train_data = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            collate_fn=collate_function_optimized,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=(num_workers > 0),
-            # prefetch_factor=4 if num_workers > 0 else None,
-            drop_last=True,
-            multiprocessing_context='fork' if num_workers > 0 else None
+            train_dataset, batch_size=batch_size, collate_fn=collate_function_global_topology,
+            shuffle=True, num_workers=effective_workers, pin_memory=False,
+            drop_last=True, persistent_workers=False
         )
         return train_data, None
