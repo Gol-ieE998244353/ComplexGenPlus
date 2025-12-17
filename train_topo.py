@@ -1,5 +1,6 @@
 """
-train_topo.py - 拓扑VAE训练
+train_topo.py v6.1 - 拓扑VAE训练
+MODIFIED v6.1: 修复DDP unused parameter问题
 """
 
 import argparse, os, logging, gc
@@ -21,12 +22,11 @@ def get_args():
     p = argparse.ArgumentParser()
     p.add_argument('--experiment_name', type=str, required=True)
     p.add_argument('--batch_size', type=int, default=4)
-    p.add_argument('--max_epochs', type=int, default=500)
+    p.add_argument('--max_epochs', type=int, default=1000)
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--weight_decay', type=float, default=1e-5)
     p.add_argument('--grad_accum', type=int, default=1)
     p.add_argument('--grad_clip', type=float, default=1.0)
-    
     p.add_argument('--data_folder', type=str, default='data/default/train')
     p.add_argument('--val_folder', type=str, default='data/train_small')
     p.add_argument('--quicktest', action='store_true')
@@ -35,14 +35,12 @@ def get_args():
     p.add_argument('--rotation_augment', action='store_true')
     p.add_argument('--noise', type=int, default=0)
     p.add_argument('--num_workers', type=int, default=2)
-    
     p.add_argument('--curve_patch_checkpoint', type=str, required=True)
     p.add_argument('--hidden_dim', type=int, default=512)
     p.add_argument('--latent_dim', type=int, default=256)
     p.add_argument('--num_layers', type=int, default=6)
     p.add_argument('--dropout', type=float, default=0.1)
     p.add_argument('--max_halfedges', type=int, default=50000)
-    
     p.add_argument('--kl_warmup', type=int, default=50)
     p.add_argument('--save_interval', type=int, default=50)
     p.add_argument('--eval_interval', type=int, default=10)
@@ -102,7 +100,6 @@ def train_epoch(model, loader, opt, scaler, curve_enc, patch_enc, he_builder, kl
     model.train()
     losses_sum, n_batch = {}, 0
     opt.zero_grad(set_to_none=True)
-    
     for i, (curves, patches) in enumerate(tqdm(loader, disable=rank != 0)):
         if curves is None: continue
         try:
@@ -111,26 +108,23 @@ def train_epoch(model, loader, opt, scaler, curve_enc, patch_enc, he_builder, kl
                 he = {k: v[:, :args.max_halfedges] if isinstance(v, torch.Tensor) and v.dim() > 1 else v for k, v in he.items()}
             he = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in he.items()}
             if he['mask'].sum() == 0: continue
-            
             c_lat, p_lat = encode_cp(curves, patches, curve_enc, patch_enc, device, args.use_amp)
             target = prepare_target(he, c_lat, p_lat, device)
-            
             with autocast(enabled=args.use_amp):
-                pred = model(c_lat, p_lat, he)
+                m = model.module if hasattr(model, 'module') else model
+                pred = m(c_lat, p_lat, he)
                 losses = compute_topo_loss(pred, target, he, kl_w, cfg)
                 loss = losses['total'] / args.grad_accum
-            
-            if torch.isnan(loss): opt.zero_grad(set_to_none=True); continue
-            
+            if torch.isnan(loss) or torch.isinf(loss): 
+                opt.zero_grad(set_to_none=True)
+                continue
             scaler.scale(loss).backward() if args.use_amp else loss.backward()
-            
             if (i + 1) % args.grad_accum == 0:
                 if args.use_amp: scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 scaler.step(opt) if args.use_amp else opt.step()
                 if args.use_amp: scaler.update()
                 opt.zero_grad(set_to_none=True)
-            
             for k, v in losses.items(): losses_sum[k] = losses_sum.get(k, 0) + v.item()
             n_batch += 1
             if i % 50 == 0: clear_mem()
@@ -155,7 +149,8 @@ def validate(model, loader, curve_enc, patch_enc, he_builder, kl_w, cfg, device,
             c_lat, p_lat = encode_cp(curves, patches, curve_enc, patch_enc, device, args.use_amp)
             target = prepare_target(he, c_lat, p_lat, device)
             with autocast(enabled=args.use_amp):
-                pred = model(c_lat, p_lat, he)
+                m = model.module if hasattr(model, 'module') else model
+                pred = m(c_lat, p_lat, he)
                 losses = compute_topo_loss(pred, target, he, kl_w, cfg)
             for k, v in losses.items(): losses_sum[k] = losses_sum.get(k, 0) + v.item()
             n += 1
@@ -171,8 +166,7 @@ def train(rank, world_size, args):
         device = f'cuda:{rank}'
     else:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    exp_dir = os.path.join('experiments', args.experiment_name + '_topo')
+    exp_dir = os.path.join('experiments', args.experiment_name)
     ckpt_dir = os.path.join(exp_dir, 'ckpt')
     if rank == 0:
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -180,7 +174,6 @@ def train(rank, world_size, args):
                             handlers=[logging.FileHandler(f'{exp_dir}/train.log'), logging.StreamHandler()])
         logger = logging.getLogger()
         wandb.init(project='topo-vae', name=args.experiment_name, config=vars(args))
-    
     from data_loader_optimized import train_data_loader_clean
     data_dir = 'data/train_small' if args.quicktest else args.data_folder
     val_dir = 'data/train_small' if args.quicktest else args.val_folder
@@ -204,41 +197,34 @@ def train(rank, world_size, args):
         rank=rank,
         world_size=world_size
     )
-    
     curve_enc, patch_enc, base_cfg = load_frozen_encoders(args.curve_patch_checkpoint, device)
-    
     topo_cfg = TopoConfig(CURVE_LATENT_DIM=base_cfg.CURVE_LATENT_DIM, PATCH_LATENT_DIM=base_cfg.PATCH_LATENT_DIM,
-                          HIDDEN_DIM=args.hidden_dim, LATENT_DIM=args.latent_dim, NUM_LAYERS=args.num_layers,
+                          HIDDEN_DIM=args.hidden_dim, LATENT_DIM=args.latent_dim, NUM_ENC_LAYERS=args.num_layers,
                           DROPOUT=args.dropout, KL_WARMUP_EPOCHS=args.kl_warmup)
     model = TopoVAE(topo_cfg).to(device)
-    if world_size > 1: model = DDP(model, device_ids=[rank])
-    
+    if world_size > 1: 
+        model = DDP(model, device_ids=[rank])
     if rank == 0: logger.info(f'Params: {sum(p.numel() for p in model.parameters()):,}')
-    
     opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = GradScaler(enabled=args.use_amp)
     kl_sched = KLScheduler(topo_cfg.KL_WEIGHT_START, topo_cfg.KL_WEIGHT_END, topo_cfg.KL_WARMUP_EPOCHS)
     he_builder = HalfEdgeBuilder(endpoint_tol=1e-4)
-    
     start_epoch, best_loss = 0, float('inf')
     if args.checkpoint and os.path.exists(args.checkpoint):
         ckpt = torch.load(args.checkpoint, map_location=device)
         (model.module if world_size > 1 else model).load_state_dict({k.replace('module.', ''): v for k, v in ckpt['model'].items()})
         opt.load_state_dict(ckpt['optimizer'])
         start_epoch = ckpt['epoch'] + 1
+        print("WE HAVE LOADED THE CHECKPOINT")
         best_loss = ckpt.get('best_loss', float('inf'))
         del ckpt; clear_mem()
-    
     for epoch in range(start_epoch, args.max_epochs):
         if train_sampler: train_sampler.set_epoch(epoch)
         kl_w = kl_sched.get_weight(epoch)
-        
         train_losses = train_epoch(model, train_loader, opt, scaler, curve_enc, patch_enc, he_builder, kl_w, topo_cfg, device, rank, args)
-        
         if rank == 0:
             logger.info(f'Epoch {epoch+1} train: ' + ' '.join(f'{k}={v:.4f}' for k, v in train_losses.items()))
             wandb.log({f'train/{k}': v for k, v in train_losses.items()}, step=epoch)
-        
         if (epoch + 1) % args.eval_interval == 0:
             val_losses = validate(model, val_loader, curve_enc, patch_enc, he_builder, kl_w, topo_cfg, device, args)
             if rank == 0:
@@ -249,12 +235,10 @@ def train(rank, world_size, args):
                     torch.save({'epoch': epoch, 'model': (model.module if world_size > 1 else model).state_dict(),
                                 'optimizer': opt.state_dict(), 'best_loss': best_loss, 'config': topo_cfg},
                                os.path.join(ckpt_dir, 'best.pth'))
-        
         if rank == 0 and (epoch + 1) % args.save_interval == 0:
             torch.save({'epoch': epoch, 'model': (model.module if world_size > 1 else model).state_dict(),
                         'optimizer': opt.state_dict(), 'config': topo_cfg}, os.path.join(ckpt_dir, f'epoch_{epoch+1}.pth'))
         clear_mem()
-    
     if rank == 0: wandb.finish()
     if world_size > 1: dist.destroy_process_group()
 

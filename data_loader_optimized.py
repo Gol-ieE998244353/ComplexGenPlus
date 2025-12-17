@@ -1,4 +1,3 @@
-# data_loader_global_topology.py - 全局拓扑处理的数据加载器（内存优化版）
 import numpy as np
 import os
 import torch
@@ -9,6 +8,7 @@ import random
 import gc
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import Dataset, DataLoader
+from numpy import linalg
 
 average_patch_area = 0
 average_squared_curve_length = 0
@@ -88,7 +88,6 @@ def build_lazy_index(data_folder):
         filepath = os.path.join(data_folder, file)
         
         if read_from_packed:
-            # 对于packed文件，需要记录每个sample的位置
             with open(filepath, "rb") as rf:
                 while True:
                     offset = rf.tell()
@@ -97,24 +96,20 @@ def build_lazy_index(data_folder):
                     except EOFError:
                         break
                     
-                    # 快速验证sample有效性
                     if not _validate_sample_quick(sample):
                         continue
                     
                     length = rf.tell() - offset
                     index_list.append(LazyDataIndex(filepath, offset, length))
                     
-                    # 统计信息（轻量级）
                     for curve in sample.get('curves', []):
                         if curve.get('curve_length', 0) >= 1e-3:
                             curve_length_stat.append(curve['curve_length'])
                     for patch in sample.get('patches', []):
                         patch_area_stat.append(patch.get('patch_area', 0))
         else:
-            # 单个文件直接索引
             index_list.append(LazyDataIndex(filepath, 0, -1))
     
-    # 计算全局统计
     global average_patch_area, average_squared_curve_length
     if curve_length_stat:
         average_squared_curve_length = np.mean(np.square(curve_length_stat))
@@ -136,7 +131,6 @@ def _validate_sample_quick(sample):
         return False
     if len(sample.get('curves', [])) == 0:
         return False
-    # 检查是否有过短的曲线
     for curve in sample.get('curves', []):
         if curve.get('curve_length', 0) < 1e-3:
             return False
@@ -150,7 +144,6 @@ def load_and_process_sample(index_item):
             rf.seek(index_item.offset)
         sample = pickle.load(rf)
     
-    # 轻量级处理
     processed = {
         'surface_points': sample['surface_points'].astype(np.float32),
         'curves': [],
@@ -187,7 +180,52 @@ def load_and_process_sample(index_item):
     return processed
 
 
-# 预计算旋转矩阵（模块级别，避免重复计算）
+# ============ 新增：点云体素化函数（从文档二移植） ============
+def points2sparse_voxel(points_with_normal, voxel_dim, feature_type, with_normal, pad1s):
+    """将点云转换为稀疏体素表示"""
+    points = points_with_normal[:,:3] + 0.5  # to [0, 1]
+    voxel_dict = {}
+    voxel_length = 1.0 / voxel_dim
+    voxel_coord = np.clip(np.floor(points / voxel_length).astype(np.int32), 0, voxel_dim-1)
+    points_normal_norm = linalg.norm(points_with_normal[:,3:], axis=1, keepdims=True)
+    points_normal_norm[points_normal_norm < th_norm] = th_norm
+    
+    if feature_type == 'local':
+        local_coord = (points - voxel_coord.astype(np.float32)*voxel_length)*voxel_dim - 0.5
+        local_coord = np.concatenate([local_coord, points_with_normal[:,3:] / points_normal_norm, 
+                                     np.ones([local_coord.shape[0], 1])], axis=-1)
+    elif feature_type == 'global':
+        local_coord = points - 0.5
+        local_coord = np.concatenate([local_coord, points_with_normal[:,3:] / points_normal_norm, 
+                                     np.ones([local_coord.shape[0], 1])], axis=-1)
+    
+    for i in range(voxel_coord.shape[0]):
+        coord_tuple = (voxel_coord[i,0], voxel_coord[i,1], voxel_coord[i,2])
+        if coord_tuple not in voxel_dict:
+            voxel_dict[coord_tuple] = local_coord[i]
+        else:
+            voxel_dict[coord_tuple] += local_coord[i]
+    
+    locations = np.array(list(voxel_dict.keys()))
+    features = np.array(list(voxel_dict.values()))
+    points_in_voxel = features[:,6:]
+    features = features / points_in_voxel
+    position = features[:,:3]
+    normals = features[:,3:6]
+    pad_ones = features[:,6:]
+    normals /= linalg.norm(normals, axis=-1, keepdims=True) + 1e-10
+    
+    if with_normal and pad1s:
+        features = np.concatenate([position, normals, pad_ones], axis=1)
+    elif pad1s:
+        features = np.concatenate([position, pad_ones], axis=1)
+    elif with_normal:
+        features = np.concatenate([position, normals], axis=1)
+    else:
+        features = position
+    return locations.astype(np.int32), features.astype(np.float32)
+
+
 _ROTATION_MATRICES = None
 
 def _get_rotation_matrices():
@@ -224,8 +262,9 @@ class ABCDatasetOptimized(Dataset):
     """内存优化的数据集 - 惰性加载"""
     
     def __init__(self, data_folder, random_rotation=False, random_angle=False, 
-                 flag_noise=0, flag_grid=False, num_angles=4, dim_grid=10):
-        # 构建惰性索引而不是加载所有数据
+                 flag_noise=0, flag_grid=False, num_angles=4, dim_grid=10,
+                 with_pointcloud=False, voxel_dim=32, feature_type='global', 
+                 with_normal=True, pad1s=True):  # 新增：点云相关参数
         self.index_list, self.data_folder = build_lazy_index(data_folder)
         self.random_rotation_augmentation = random_rotation
         self.random_angle = random_angle
@@ -234,7 +273,13 @@ class ABCDatasetOptimized(Dataset):
         self.num_angles = num_angles
         self.dim_grid = dim_grid
         
-        # 预计算旋转矩阵
+        # 新增：点云处理参数
+        self.with_pointcloud = with_pointcloud
+        self.voxel_dim = voxel_dim
+        self.feature_type = feature_type
+        self.with_normal = with_normal
+        self.pad1s = pad1s
+        
         self.rotation_matrices = _get_rotation_matrices()
     
     def __len__(self):
@@ -262,8 +307,8 @@ class ABCDatasetOptimized(Dataset):
             return R.random().as_matrix().astype(np.float32)
     
     def _process_curve(self, curve, rot=None):
-        """处理单个curve - 原地操作减少内存"""
-        points = curve['points']  # 不复制
+        """处理单个curve"""
+        points = curve['points']
         
         if rot is not None:
             points = np.dot(points, rot)
@@ -296,7 +341,7 @@ class ABCDatasetOptimized(Dataset):
         }
     
     def _process_patch(self, patch, item_points, rot=None):
-        """处理单个patch - 原地操作减少内存"""
+        """处理单个patch"""
         if not self.flag_grid:
             patch_data = item_points[patch['patch_points']]
             patch_points = patch_data[:, :3]
@@ -318,7 +363,6 @@ class ABCDatasetOptimized(Dataset):
             patch_points = np.dot(patch_points, rot)
             patch_normals = np.dot(patch_normals, rot)
         
-        # 归一化法向量 - 原地操作
         norm = np.linalg.norm(patch_normals, axis=-1, keepdims=True)
         norm = np.maximum(norm, th_norm)
         patch_normals = patch_normals / norm
@@ -345,7 +389,6 @@ class ABCDatasetOptimized(Dataset):
         }
     
     def __getitem__(self, idx):
-        # 惰性加载样本
         sample_data = load_and_process_sample(self.index_list[idx % len(self.index_list)])
         item_points = sample_data['surface_points']
         
@@ -384,17 +427,40 @@ class ABCDatasetOptimized(Dataset):
             if pp is not None:
                 processed_patches.append(pp)
         
-        return (processed_curves, processed_patches)
+        # 新增：条件性处理点云
+        locations, features = None, None
+        if self.with_pointcloud:
+            locations, features = points2sparse_voxel(
+                item_points, self.voxel_dim, self.feature_type, 
+                self.with_normal, self.pad1s
+            )
+        
+        return (locations, features, processed_curves, processed_patches)
 
 
 def collate_function_global_topology(batch_list):
     """
-    全局拓扑处理的collate函数 - 内存优化版
+    全局拓扑处理的collate函数 - 支持点云
     """
     batch_size = len(batch_list)
     
-    all_curves = [item[0] for item in batch_list]
-    all_patches = [item[1] for item in batch_list]
+    # 新增：提取点云数据
+    all_locations = [item[0] for item in batch_list]
+    all_features = [item[1] for item in batch_list]
+    all_curves = [item[2] for item in batch_list]
+    all_patches = [item[3] for item in batch_list]
+    
+    # 新增：拼接点云数据（如果存在）
+    pointcloud_data = None
+    if all_locations[0] is not None:  # 检查是否有点云数据
+        locations_with_batch = [
+            np.concatenate([all_locations[i], np.ones([all_locations[i].shape[0], 1], dtype=np.int32)*i], axis=-1) 
+            for i in range(batch_size)
+        ]
+        pointcloud_data = (
+            torch.from_numpy(np.concatenate(locations_with_batch, axis=0)),
+            torch.from_numpy(np.concatenate(all_features, axis=0))
+        )
     
     # === Step 1: 收集curves数据 ===
     processed_curves = None
@@ -403,7 +469,6 @@ def collate_function_global_topology(batch_list):
     if valid_curves:
         max_n_curves = max(len(c) for c in all_curves)
         if max_n_curves > 0:
-            # 预分配tensor
             curve_points_batch = torch.zeros(batch_size, max_n_curves, 34, 3, dtype=torch.float32)
             endpoints_batch = torch.zeros(batch_size, max_n_curves, 2, 3, dtype=torch.float32)
             is_closed_batch = torch.zeros(batch_size, max_n_curves, dtype=torch.bool)
@@ -441,7 +506,6 @@ def collate_function_global_topology(batch_list):
     if valid_patches:
         max_n_patches = max(len(p) for p in all_patches)
         if max_n_patches > 0:
-            # 确定patch点数
             first_patch = valid_patches[0][0] if valid_patches[0] else None
             n_patch_pts = 100 if first_patch and len(first_patch['patch_points']) <= 100 else 400
             
@@ -489,7 +553,11 @@ def collate_function_global_topology(batch_list):
                 "curves_info": patches_curves_info
             }
     
-    return (processed_curves, processed_patches)
+    # 新增：返回值包含点云数据（如果有）
+    if pointcloud_data is not None:
+        return (pointcloud_data, processed_curves, processed_patches)
+    else:
+        return (processed_curves, processed_patches)
 
 
 def data_loader_ABC(data_folder):
@@ -501,9 +569,11 @@ def data_loader_ABC(data_folder):
 def train_data_loader_clean(batch_size=32, data_folder="data/default/train", 
                             rotation_augmentation=False, random_angle=False, 
                             flag_noise=0, flag_grid=False, num_angle=4, dim_grid=10,
-                            num_workers=8, rank=0, world_size=1):
+                            num_workers=8, rank=0, world_size=1,
+                            with_pointcloud=False, voxel_dim=128, feature_type='global',
+                            with_normal=True, pad1s=True):  # 新增：点云相关参数
     """
-    带全局拓扑处理的数据加载器 - 内存优化版
+    带全局拓扑处理的数据加载器 - 内存优化版 + 点云支持
     """
     if not os.path.exists(os.path.join(data_folder, "packed")):
         if rank == 0:
@@ -520,10 +590,14 @@ def train_data_loader_clean(batch_size=32, data_folder="data/default/train",
         flag_noise=flag_noise,
         flag_grid=flag_grid,
         num_angles=num_angle,
-        dim_grid=dim_grid
+        dim_grid=dim_grid,
+        with_pointcloud=with_pointcloud,  # 新增
+        voxel_dim=voxel_dim,  # 新增
+        feature_type=feature_type,  # 新增
+        with_normal=with_normal,  # 新增
+        pad1s=pad1s  # 新增
     )
     
-    # 减少num_workers以降低内存使用
     effective_workers = min(num_workers, 2)
     
     if world_size > 1:
