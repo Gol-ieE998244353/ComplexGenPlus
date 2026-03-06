@@ -86,11 +86,12 @@ def data_loader_ABC(data_folder):
                     break
                 
                 if read_from_packed_pkl:
-                    file = sample['filename']
+                    file = sample.get('filename', 'unknown.pkl')
                 
                 file_count += 1
                 processed_sample = {}
                 processed_sample['surface_points'] = sample['surface_points']
+                processed_sample['filename'] = file
                 scale = 1.0
                 translation = np.zeros(3)
                 

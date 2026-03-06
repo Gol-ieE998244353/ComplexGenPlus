@@ -1,4 +1,3 @@
-# train.py - 优化版本3（数据预处理前置）
 import argparse
 import torch
 import torch.nn as nn
@@ -15,17 +14,18 @@ from datetime import datetime
 import wandb
 from torch.cuda.amp import autocast, GradScaler
 
-from data_loader_pc import *
-
+from data_loader_optimized import *
 class Config:
     D_MODEL = 512
     NHEAD = 8
-    DROPOUT = 0.05
-    CURVE_LATENT_DIM = 256
-    PATCH_LATENT_DIM = 384
+    DROPOUT = 0.15
+    CURVE_LATENT_DIM = 16
+    PATCH_LATENT_DIM = 32
     PATCH_NUM_POINTS = 400
     MAX_CURVES = 100
     MAX_PATCHES = 50 
+    MAX_TOTAL_ITEMS = 200
+    BUCKET_BOUNDARIES = [10, 30, 60, 100, 200, 400, 800, 1600]
     HN_PE_DIM = 64
     HN_MLP_DIM = 128
     CURVE_NUM_CLASSES = 4
@@ -34,11 +34,11 @@ class Config:
     KL_WEIGHT_END = 0.0001
     KL_WARMUP_EPOCHS = 100  
     KL_FREE_BITS = 0.5  
-    LEARNING_RATE = 5e-4
-    WEIGHT_DECAY = 1e-5
+    LEARNING_RATE = 5e-5
+    WEIGHT_DECAY = 5e-6
     GRAD_CLIP_NORM = 1.0 
-    EVAL_INTERVAL = 100  
-    SAVE_INTERVAL = 100
+    EVAL_INTERVAL = 5
+    SAVE_INTERVAL = 20
     USE_AMP = False
     GRADIENT_ACCUMULATION_STEPS = 1
     LOG_INTERVAL = 50000
@@ -47,17 +47,14 @@ class Config:
     TOPOLOGY_WEIGHT = 0.5
     LABEL_WEIGHT = 0.5
     VALIDITY_WEIGHT = 0.5
+    CURVATURE_WEIGHT = 0.5
     SCALE_FEATURE_DIM = 16
     CENTER_FEATURE_DIM = 16
     ENDPOINT_FEATURE_DIM = 48
     CLOSED_FEATURE_DIM = 12
     LABEL_FEATURE_DIM = 16
     TOPO_FEATURE_DIM = 20
-    USE_SMOOTHNESS_LOSS = False       
-    CURVE_SMOOTHNESS_TAU = 0.01
-    PATCH_SMOOTHNESS_TAU = 0.02
     PATCH_NORMAL_TAU = 0.1
-    SMOOTHNESS_WEIGHT = 0.1
     LOGVAR_MIN = -10.0
     LOGVAR_MAX = 10.0
     SCALE_MIN = 1e-4
@@ -146,11 +143,9 @@ def get_args_parser():
     parser.add_argument('--max_training_iterations', default=250001, type=int)
     parser.add_argument('--checkpoint_path', default=None, type=str)
     parser.add_argument('--gpu', default="0,1,2", type=str)
-    parser.add_argument('--use_smoothness_loss', action='store_true')
-    parser.add_argument('--curve_smoothness_tau', default=0.01, type=float)
-    parser.add_argument('--patch_smoothness_tau', default=0.02, type=float)
-    parser.add_argument('--smoothness_weight', default=0.1, type=float)
-    parser.add_argument('--extra_single_chamfer', action='store_true')
+    parser.add_argument('--add_data_mode', action='store_true', help='Reset optimizer for training with new data')
+    parser.add_argument('--dynamic_batch', action='store_true', help='Enable dynamic bucketed batch sizes')
+    parser.add_argument('--bucketed_batch', action='store_true', help='Enable bucketed fixed batch sizes')
     return parser
 
 points_per_curve = 34
@@ -168,31 +163,65 @@ class Curve1DEncoder(nn.Module):
             nn.Dropout(dropout),
             nn.Conv1d(128, 256, 3, padding=1),
             nn.BatchNorm1d(256),
-            nn.GELU(),
+            nn.GELU()
         )
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.proj = nn.Linear(256, output_dim)
+        
+        # 2. 注意力模块 
+        self.attention_net = nn.Sequential(
+            nn.Conv1d(256, 64, 1), # 降维
+            nn.Tanh(),             # 激活
+            nn.Conv1d(64, 1, 1)    # 输出分数
+        )
+        
+        # 3. 最大池化
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
+        self.proj = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            # nn.Dropout(dropout),
+            nn.Linear(512, output_dim) # 最终压缩回 256
+        )
     
     def forward(self, points):
         B, N, P, C = points.shape
-        # Reshape to (B*N, C, P) for Conv1d
-        x = points.view(B*N, P, C).transpose(1, 2)  # (B*N, C, P)
-        x = self.encoder(x)  # (B*N, 256, P')
-        x = self.pool(x).squeeze(-1)  # (B*N, 256)
-        return self.proj(x).view(B, N, -1)  # (B, N, output_dim)
+        # 变换维度: (B*N, C, P)
+        x = points.view(B*N, P, C).transpose(1, 2)
+        
+        # 1. 提取逐点特征 (Local Features)
+        feat = self.encoder(x)  # Shape: (B*N, 256, P)
+        
+        # 2. 分支一：Attention Pooling
+        # 计算权重: (B*N, 1, P)
+        scores = self.attention_net(feat)
+        weights = F.softmax(scores, dim=2) 
+        # 加权求和: sum( (B*N, 256, P) * (B*N, 1, P) ) -> (B*N, 256)
+        global_feat_attn = torch.sum(feat * weights, dim=2)
+        
+        # 3. 分支二：Max Pooling
+        # 取最大值: (B*N, 256)
+        global_feat_max = self.max_pool(feat).squeeze(-1)
+        
+        # 4. Concatenation
+        combined = torch.cat([global_feat_attn, global_feat_max], dim=1) # (B*N, 512)
+        
+        # 5. 最终投影
+        out = self.proj(combined) # (B*N, 256)
+        
+        return out.view(B, N, -1)
+
 class Patch2DEncoder(nn.Module):
     def __init__(self, input_channels=6, output_dim=384, dropout=0.1, grid_size=20):
         super().__init__()
         self.grid_size = grid_size
         
-        # 位置和法向量独立编码 - 避免耦合
         self.position_encoder = nn.Sequential(
             nn.Conv2d(3, 64, kernel_size=3, padding=1),
             nn.GroupNorm(8, 64),
             nn.GELU(),
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(16, 128),
-            nn.GELU(),
+            nn.GELU()
         )
         
         self.normal_encoder = nn.Sequential(
@@ -201,22 +230,31 @@ class Patch2DEncoder(nn.Module):
             nn.GELU(),
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(16, 128),
-            nn.GELU(),
+            nn.GELU()
         )
         
-        # 融合特征
         self.fusion_encoder = nn.Sequential(
             nn.Conv2d(256, 256, kernel_size=3, padding=1),
             nn.GroupNorm(32, 256),
             nn.GELU(),
+            
             nn.Dropout2d(dropout),
             nn.Conv2d(256, 384, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(32, 384),
             nn.GELU(),
         )
         
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.proj = nn.Linear(384, output_dim)
+        self.attn_net = nn.Sequential(
+            nn.Conv2d(384, 64, 1),
+            nn.Tanh(),
+            nn.Conv2d(64, 1, 1)
+        )
+        
+        # 2. 定义 2D MaxPool
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        # 3. 修改投影层输入维度 (384 * 2)
+        self.proj = nn.Linear(384 * 2, output_dim)
     
     def forward(self, patch_data):
         B, N, HW, C = patch_data.shape
@@ -225,17 +263,32 @@ class Patch2DEncoder(nn.Module):
         positions = patch_data[..., :3].view(B*N, H, W, 3).permute(0, 3, 1, 2)
         normals = patch_data[..., 3:].view(B*N, H, W, 3).permute(0, 3, 1, 2)
         
-        # 确保法向量归一化
         normals = F.normalize(normals, dim=1, eps=1e-8)
         
-        # 独立编码后融合
         pos_feat = self.position_encoder(positions)
         norm_feat = self.normal_encoder(normals)
         combined = torch.cat([pos_feat, norm_feat], dim=1)
         
         x = self.fusion_encoder(combined)
-        x = self.pool(x).squeeze(-1).squeeze(-1)
-        return self.proj(x).view(B, N, -1)
+        
+        feat_max = self.max_pool(x).flatten(1) # (B*N, 384)
+        
+        # Attention 分支
+        scores = self.attn_net(x) # (B*N, 1, H, W)
+        # 将 H,W 展平做 Softmax
+        B_N, _, H, W = scores.shape
+        scores = scores.view(B_N, 1, -1) # (B*N, 1, H*W)
+        weights = F.softmax(scores, dim=-1)
+        
+        # x_flat = x.view(B_N, 384, -1) # (B*N, 384, H*W)
+        x_flat = x.view(B_N, 384, -1) # (B*N, 384, H*W)
+        feat_attn = torch.sum(x_flat * weights, dim=-1) # (B*N, 384)
+            
+        combined = torch.cat([feat_attn, feat_max], dim=1)
+        return self.proj(combined).view(B, N, -1)
+    
+
+    
 class CurveEncoder(nn.Module):
     def __init__(self, config=Config):
         super().__init__()
@@ -310,7 +363,7 @@ class CurveDecoder(nn.Module):
         label_logits = torch.clamp(self.label_head(z), -10, 10)
         validity_logits = torch.clamp(self.validity_head(z).squeeze(-1), -10, 10)
         return {"points": points, "endpoints": endpoints, "closed_logits": closed_logits, "label_logits": label_logits, "validity_logits": validity_logits}
-
+    
 class PatchEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -327,6 +380,7 @@ class PatchEncoder(nn.Module):
 
     def forward(self, patch_points, patch_normals, u_closed, v_closed, labels, scale, center, mask):
         B, N = patch_points.shape[:2]
+        
         log_scale = torch.log(torch.clamp(scale, min=self.config.SCALE_MIN, max=self.config.SCALE_MAX))
         log_scale = torch.clamp(log_scale, self.config.LOG_SCALE_MIN, self.config.LOG_SCALE_MAX)
         scale_feat = self.scale_encoder(log_scale.unsqueeze(-1))
@@ -344,7 +398,6 @@ class PatchEncoder(nn.Module):
         logvar = self.to_logvar(tokens)
         logvar = torch.clamp(logvar, min=self.config.LOGVAR_MIN, max=self.config.LOGVAR_MAX)
         return mean, logvar
-
 
 class PatchDecoder(nn.Module):
     def __init__(self, config=Config):
@@ -416,43 +469,6 @@ class KLScheduler:
         progress = math.sqrt(epoch / self.warmup)
         return self.start + (self.end - self.start) * progress
 
-def compute_curve_smoothness_loss(points, mask, tau=0.01):
-    B, N, P, _ = points.shape
-    first_deriv = points[:, :, 1:, :] - points[:, :, :-1, :]
-    second_deriv = first_deriv[:, :, 1:, :] - first_deriv[:, :, :-1, :]
-    second_deriv = torch.clamp(second_deriv, -5, 5)
-    curvature = torch.norm(second_deriv, dim=-1)
-    penalty = torch.where(curvature < tau, 0.5 * curvature ** 2 / tau, curvature - 0.5 * tau)
-    penalty = torch.clamp(penalty, max=5.0)
-    mask_expanded = mask.unsqueeze(-1).float()
-    loss = (penalty * mask_expanded[:, :, :penalty.shape[2]]).sum() / mask.sum().clamp(min=1)
-    return loss
-
-def compute_patch_smoothness_loss(points, normals, mask, position_tau=0.02, normal_tau=0.1):
-    B, N, num_points, _ = points.shape
-    grid_size = int(math.sqrt(num_points))
-    grid_points = points.view(B, N, grid_size, grid_size, 3)
-    grid_normals = normals.view(B, N, grid_size, grid_size, 3)
-    laplacian = (grid_points[:, :, 2:, 1:-1, :] + grid_points[:, :, :-2, 1:-1, :] + grid_points[:, :, 1:-1, 2:, :] + grid_points[:, :, 1:-1, :-2, :] - 4 * grid_points[:, :, 1:-1, 1:-1, :])
-    laplacian = torch.clamp(laplacian, -5, 5)
-    laplacian_norm = torch.norm(laplacian, dim=-1)
-    position_penalty = torch.where(laplacian_norm < position_tau, 0.5 * laplacian_norm ** 2 / position_tau, laplacian_norm - 0.5 * position_tau)
-    position_penalty = torch.clamp(position_penalty, max=5.0)
-    mask_expanded = mask.view(B, N, 1, 1).float()
-    position_loss = (position_penalty * mask_expanded).sum() / mask.sum().clamp(min=1)
-    normal_diff_u = grid_normals[:, :, 1:, :, :] - grid_normals[:, :, :-1, :, :]
-    normal_diff_v = grid_normals[:, :, :, 1:, :] - grid_normals[:, :, :, :-1, :]
-    normal_change_u = torch.norm(normal_diff_u, dim=-1).clamp(max=2.0)
-    normal_change_v = torch.norm(normal_diff_v, dim=-1).clamp(max=2.0)
-    penalty_u = torch.where(normal_change_u < normal_tau, 0.5 * normal_change_u ** 2 / normal_tau, normal_change_u - 0.5 * normal_tau)
-    penalty_v = torch.where(normal_change_v < normal_tau, 0.5 * normal_change_v ** 2 / normal_tau, normal_change_v - 0.5 * normal_tau)
-    penalty_u = torch.clamp(penalty_u, max=5.0)
-    penalty_v = torch.clamp(penalty_v, max=5.0)
-    normal_loss_u = (penalty_u * mask_expanded[:, :, :penalty_u.shape[2], :]).sum()
-    normal_loss_v = (penalty_v * mask_expanded[:, :, :, :penalty_v.shape[3]]).sum()
-    normal_loss = (normal_loss_u + normal_loss_v) / mask.sum().clamp(min=1)
-    return position_loss + normal_loss
-
 def compute_stable_kl_loss(mean, logvar, mask, config):
     logvar = torch.clamp(logvar, config.LOGVAR_MIN, config.LOGVAR_MAX)
     var = torch.exp(logvar)
@@ -465,6 +481,7 @@ def compute_stable_kl_loss(mean, logvar, mask, config):
     kl = (kl * mask.float()).sum() / mask.sum().clamp(min=1)
     kl = kl / kl_per_dim.shape[-1]
     return kl
+
 def compute_patch_vae_loss(pred, target, mean, logvar, mask, kl_weight, config):
     losses = {}
     kl = compute_stable_kl_loss(mean, logvar, mask, config)
@@ -478,13 +495,11 @@ def compute_patch_vae_loss(pred, target, mean, logvar, mask, kl_weight, config):
     recon_points = (recon_points * weight_mask).sum() / mask.sum().clamp(min=1)
     losses["recon_points"] = recon_points
     
-    # 法向量损失 - 余弦损失 + L2损失组合
     pred_n = F.normalize(pred["normals"], dim=-1, eps=1e-8)
     target_n = F.normalize(target["normals"], dim=-1, eps=1e-8)
     cosine_sim = (pred_n * target_n).sum(dim=-1, keepdim=True)
     cosine_loss = 1.0 - cosine_sim
-    l2_loss = ((pred_n - target_n) ** 2).sum(dim=-1, keepdim=True)
-    recon_normals = 0.5 * cosine_loss + 0.5 * l2_loss
+    recon_normals = 0.5 * cosine_loss
     recon_normals = (recon_normals * weight_mask).sum() / mask.sum().clamp(min=1)
     losses["recon_normals"] = recon_normals
     
@@ -501,15 +516,11 @@ def compute_patch_vae_loss(pred, target, mean, logvar, mask, kl_weight, config):
     losses["label"] = label_loss
     validity_loss = F.binary_cross_entropy_with_logits(pred["validity_logits"], mask.float(), reduction="mean")
     losses["validity"] = validity_loss
-    if config.USE_SMOOTHNESS_LOSS:
-        smoothness = compute_patch_smoothness_loss(pred["points"], pred["normals"], mask, position_tau=config.PATCH_SMOOTHNESS_TAU, normal_tau=config.PATCH_NORMAL_TAU)
-        losses["smoothness"] = smoothness
-    else:
-        losses["smoothness"] = torch.tensor(0.0, device=pred["points"].device)
-    total_loss = (kl_weight * kl + config.RECON_WEIGHT * (recon_points + recon_normals) + config.TOPOLOGY_WEIGHT * (u_closed_loss + v_closed_loss) + config.LABEL_WEIGHT * label_loss + config.VALIDITY_WEIGHT * validity_loss + config.SMOOTHNESS_WEIGHT * losses["smoothness"])
+    total_loss = (kl_weight * kl + config.RECON_WEIGHT * (recon_points + recon_normals * 0.3) + config.TOPOLOGY_WEIGHT * (u_closed_loss + v_closed_loss) + config.LABEL_WEIGHT * label_loss + config.VALIDITY_WEIGHT * validity_loss) #+ config.CURVATURE_WEIGHT * curvature_loss
     total_loss = torch.clamp(total_loss, max=1e6)
     losses["total"] = total_loss
     return losses
+
 def compute_curve_vae_loss(pred, target, mean, logvar, mask, kl_weight, config):
     losses = {}
     kl = compute_stable_kl_loss(mean, logvar, mask, config)
@@ -539,12 +550,7 @@ def compute_curve_vae_loss(pred, target, mean, logvar, mask, kl_weight, config):
     losses["label"] = label_loss
     validity_loss = F.binary_cross_entropy_with_logits(pred["validity_logits"], mask.float(), reduction="mean")
     losses["validity"] = validity_loss
-    if config.USE_SMOOTHNESS_LOSS:
-        smoothness = compute_curve_smoothness_loss(pred["points"], mask, tau=config.CURVE_SMOOTHNESS_TAU)
-        losses["smoothness"] = smoothness
-    else:
-        losses["smoothness"] = torch.tensor(0.0, device=pred["points"].device)
-    total_loss = (kl_weight * kl + config.RECON_WEIGHT * (recon_points + recon_endpoints) + config.TOPOLOGY_WEIGHT * closed_loss + config.LABEL_WEIGHT * label_loss + config.VALIDITY_WEIGHT * validity_loss + config.SMOOTHNESS_WEIGHT * losses["smoothness"])
+    total_loss = (kl_weight * kl + config.RECON_WEIGHT * (recon_points + recon_endpoints) + config.TOPOLOGY_WEIGHT * closed_loss + config.LABEL_WEIGHT * label_loss + config.VALIDITY_WEIGHT * validity_loss) #+ config.CURVATURE_WEIGHT * curvature_loss
     total_loss = torch.clamp(total_loss, max=1e6)
     losses["total"] = total_loss
     return losses
@@ -613,9 +619,6 @@ class LossAccumulator:
 
 def val_pipeline(patch_encoder, patch_decoder, curve_encoder, curve_decoder, 
                 val_dataloader, val_sampler, epoch, device, config, rank=0):
-    """
-    验证流程 - 使用与训练相同的预处理数据
-    """
     if val_sampler is not None:
         val_sampler.set_epoch(epoch)
     
@@ -630,27 +633,36 @@ def val_pipeline(patch_encoder, patch_decoder, curve_encoder, curve_decoder,
     with torch.no_grad():
         pbar = tqdm(val_dataloader, desc="Validation", leave=False) if rank == 0 else val_dataloader
         for data_item in pbar:
-            # 数据已经预处理好，直接移动到GPU
-            processed_curves, processed_patches, _ = data_item
+            processed_curves, processed_patches = data_item
             processed_curves = move_to_device(processed_curves, device)
             processed_patches = move_to_device(processed_patches, device)
             
-            # 处理patches
+            # 1. 运行 Encoder
+            mean_p, z_p = None, None
             if processed_patches is not None:
+                mean_p, _ = patch_encoder(
+                    processed_patches["patch_points"], processed_patches["patch_normals"], 
+                    processed_patches["u_closed"], processed_patches["v_closed"], 
+                    processed_patches["labels"], processed_patches["scale"], 
+                    processed_patches["center"], processed_patches["mask"]
+                )
+                z_p = mean_p # Validation 时通常直接用 mean
+            
+            mean_c, z_c = None, None
+            if processed_curves is not None:
+                mean_c, _ = curve_encoder(
+                    processed_curves["curve_points"], processed_curves["endpoints"], 
+                    processed_curves["is_closed"], processed_curves["labels"], 
+                    processed_curves["scale"], processed_curves["center"], 
+                    processed_curves["mask"]
+                )
+                z_c = mean_c
+
+            # 3. 运行 Decoder
+            # 处理 Patches
+            if z_p is not None and processed_patches is not None:
                 try:
-                    mean_p, _ = patch_encoder(
-                        processed_patches["patch_points"], 
-                        processed_patches["patch_normals"], 
-                        processed_patches["u_closed"], 
-                        processed_patches["v_closed"], 
-                        processed_patches["labels"], 
-                        processed_patches["scale"], 
-                        processed_patches["center"], 
-                        processed_patches["mask"]
-                    )
-                    pred_patch = patch_decoder(mean_p)
-                    
-                    # 计算重建误差（在原始空间）
+                    pred_patch = patch_decoder(z_p)
                     pred_scale = processed_patches["scale"].unsqueeze(-1).unsqueeze(-1)
                     pred_center = processed_patches["center"].unsqueeze(-2)
                     pred_points_denorm = pred_patch["points"] * pred_scale + pred_center
@@ -658,27 +670,13 @@ def val_pipeline(patch_encoder, patch_decoder, curve_encoder, curve_decoder,
                     
                     recon = F.mse_loss(pred_points_denorm, target_points_denorm, reduction="none")
                     recon = (recon * processed_patches["mask"].unsqueeze(-1).unsqueeze(-1)).sum() / processed_patches["mask"].sum().clamp(min=1)
-                    
-                    if not torch.isnan(recon):
-                        patch_recon_errors.append(recon)
-                except:
-                    continue
-            
-            # 处理curves
-            if processed_curves is not None:
+                    if not torch.isnan(recon): patch_recon_errors.append(recon)
+                except: pass
+
+            # 处理 Curves
+            if z_c is not None and processed_curves is not None:
                 try:
-                    mean_c, _ = curve_encoder(
-                        processed_curves["curve_points"], 
-                        processed_curves["endpoints"], 
-                        processed_curves["is_closed"], 
-                        processed_curves["labels"], 
-                        processed_curves["scale"], 
-                        processed_curves["center"], 
-                        processed_curves["mask"]
-                    )
-                    pred_curve = curve_decoder(mean_c)
-                    
-                    # 计算重建误差（在原始空间）
+                    pred_curve = curve_decoder(z_c)
                     pred_scale = processed_curves["scale"].unsqueeze(-1).unsqueeze(-1)
                     pred_center = processed_curves["center"].unsqueeze(-2)
                     pred_points_denorm = pred_curve["points"] * pred_scale + pred_center
@@ -686,29 +684,20 @@ def val_pipeline(patch_encoder, patch_decoder, curve_encoder, curve_decoder,
                     
                     recon = F.mse_loss(pred_points_denorm, target_points_denorm, reduction="none")
                     recon = (recon * processed_curves["mask"].unsqueeze(-1).unsqueeze(-1)).sum() / processed_curves["mask"].sum().clamp(min=1)
-                    
-                    if not torch.isnan(recon):
-                        curve_recon_errors.append(recon)
-                except:
-                    continue
-    
-    # 计算平均指标
+                    if not torch.isnan(recon): curve_recon_errors.append(recon)
+                except: pass
+
     val_metrics = {}
-    if patch_recon_errors:
-        val_metrics["patch"] = {"recon_error": torch.stack(patch_recon_errors).mean().item()}
-    if curve_recon_errors:
-        val_metrics["curve"] = {"recon_error": torch.stack(curve_recon_errors).mean().item()}
+    if patch_recon_errors: val_metrics["patch"] = {"recon_error": torch.stack(patch_recon_errors).mean().item()}
+    if curve_recon_errors: val_metrics["curve"] = {"recon_error": torch.stack(curve_recon_errors).mean().item()}
     
-    # 恢复训练模式
-    patch_encoder.train()
-    patch_decoder.train()
-    curve_encoder.train()
-    curve_decoder.train()
+    patch_encoder.train(); patch_decoder.train()
+    curve_encoder.train(); curve_decoder.train()
     
     return val_metrics
 
 def train_pipeline(rank, num_gpus, args, config):
-    dist.init_process_group(backend="nccl", init_method="tcp://127.0.0.1:23259", world_size=num_gpus, rank=rank)
+    dist.init_process_group(backend="nccl", init_method="tcp://127.0.0.1:23257", world_size=num_gpus, rank=rank)
     if num_gpus > 1:
         torch.cuda.set_device(rank)
         device = f"cuda:{rank}"
@@ -737,6 +726,9 @@ def train_pipeline(rank, num_gpus, args, config):
         )
     
     # 使用优化后的dataloader - 数据已在Dataset中预处理
+    use_bucketed = args.dynamic_batch or args.bucketed_batch
+    max_total_items = config.MAX_TOTAL_ITEMS if args.dynamic_batch else None
+
     if args.quicktest:
         train_data, distribute_sampler = train_data_loader_clean(
             args.batch_size, 
@@ -749,7 +741,11 @@ def train_pipeline(rank, num_gpus, args, config):
             dim_grid=args.points_per_patch_dim, 
             num_workers=4,  # 使用多进程加速数据预处理
             rank=rank, 
-            world_size=num_gpus
+            world_size=num_gpus,
+            use_bucketed_batch=use_bucketed,
+            max_total_items=max_total_items,
+            bucket_boundaries=config.BUCKET_BOUNDARIES,
+            shuffle=True
         )
         # Validation data（不使用augmentation）
         val_data, val_sampler = train_data_loader_clean(
@@ -763,10 +759,14 @@ def train_pipeline(rank, num_gpus, args, config):
             dim_grid=args.points_per_patch_dim,
             num_workers=4,  # val用较少的worker
             rank=rank,
-            world_size=num_gpus
+            world_size=num_gpus,
+            use_bucketed_batch=use_bucketed,
+            max_total_items=max_total_items,
+            bucket_boundaries=config.BUCKET_BOUNDARIES,
+            shuffle=False
         )
     else:
-        train_folder = "data/partial/train" if args.partial else "data/default/train"
+        train_folder = "data/partial/train" if args.partial else "data/incr"
         train_data, distribute_sampler = train_data_loader_clean(
             args.batch_size, 
             data_folder=train_folder, 
@@ -776,12 +776,16 @@ def train_pipeline(rank, num_gpus, args, config):
             flag_grid=args.patch_grid, 
             num_angle=args.num_angles, 
             dim_grid=args.points_per_patch_dim, 
-            num_workers=4,  # 使用多进程加速数据预处理
+            num_workers=2,  # 使用多进程加速数据预处理
             rank=rank, 
-            world_size=num_gpus
+            world_size=num_gpus,
+            use_bucketed_batch=use_bucketed,
+            max_total_items=max_total_items,
+            bucket_boundaries=config.BUCKET_BOUNDARIES,
+            shuffle=True
         )
         # Validation data（不使用augmentation）
-        val_folder = "data/partial/val" if args.partial else "data/default/val"
+        val_folder = "data/partial/val" if args.partial else "data/large/val"
         val_data, val_sampler = train_data_loader_clean(
             args.batch_size,
             data_folder=val_folder,
@@ -791,9 +795,13 @@ def train_pipeline(rank, num_gpus, args, config):
             flag_grid=args.patch_grid,
             num_angle=4,
             dim_grid=args.points_per_patch_dim,
-            num_workers=4,  # val用较少的worker
+            num_workers=2,  # val用较少的worker
             rank=rank,
-            world_size=num_gpus
+            world_size=num_gpus,
+            use_bucketed_batch=use_bucketed,
+            max_total_items=max_total_items,
+            bucket_boundaries=config.BUCKET_BOUNDARIES,
+            shuffle=False
         )
     
     patch_encoder = PatchEncoder(config).to(device)
@@ -801,36 +809,66 @@ def train_pipeline(rank, num_gpus, args, config):
     curve_encoder = CurveEncoder(config).to(device)
     curve_decoder = CurveDecoder(config).to(device)
     
+        
     if num_gpus > 1:
         patch_encoder = nn.parallel.DistributedDataParallel(patch_encoder, device_ids=[rank])
         patch_decoder = nn.parallel.DistributedDataParallel(patch_decoder, device_ids=[rank])
         curve_encoder = nn.parallel.DistributedDataParallel(curve_encoder, device_ids=[rank])
         curve_decoder = nn.parallel.DistributedDataParallel(curve_decoder, device_ids=[rank])
+        
     
     patch_params = list(patch_encoder.parameters()) + list(patch_decoder.parameters())
     curve_params = list(curve_encoder.parameters()) + list(curve_decoder.parameters())
     patch_optimizer = torch.optim.AdamW(patch_params, lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
     curve_optimizer = torch.optim.AdamW(curve_params, lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
-    patch_scaler = GradScaler() if config.USE_AMP else None
-    curve_scaler = GradScaler() if config.USE_AMP else None
+    scaler = GradScaler(enabled=config.USE_AMP)
+    all_params = patch_params + curve_params
     kl_scheduler = KLScheduler(config.KL_WEIGHT_START, config.KL_WEIGHT_END, config.KL_WARMUP_EPOCHS)
     
     start_epoch = 0
     if args.checkpoint_path and os.path.exists(args.checkpoint_path):
         if rank == 0:
             logger.info(f"Loading checkpoint from {args.checkpoint_path}")
+        
         checkpoint = torch.load(args.checkpoint_path, map_location=device)
-        patch_encoder.load_state_dict(checkpoint["patch_encoder"])
-        patch_decoder.load_state_dict(checkpoint["patch_decoder"])
-        curve_encoder.load_state_dict(checkpoint["curve_encoder"])
-        curve_decoder.load_state_dict(checkpoint["curve_decoder"])
-        patch_optimizer.load_state_dict(checkpoint["patch_optimizer"])
-        curve_optimizer.load_state_dict(checkpoint["curve_optimizer"])
-        if config.USE_AMP and "patch_scaler" in checkpoint:
-            patch_scaler.load_state_dict(checkpoint["patch_scaler"])
-            curve_scaler.load_state_dict(checkpoint["curve_scaler"])
-        start_epoch = checkpoint["epoch"] + 1
+
+        # 定义一个简单的修复函数
+        def fix_state_dict(state_dict, model_obj):
+            from collections import OrderedDict
+            new_state_dict = OrderedDict()
+            # 检查当前模型是否使用了 DDP (即是否含有 module. 前缀)
+            model_has_module = any(k.startswith('module.') for k in model_obj.state_dict().keys())
+            
+            for k, v in state_dict.items():
+                if model_has_module and not k.startswith('module.'):
+                    name = 'module.' + k  # 给权重加上前缀以匹配 DDP 模型
+                elif not model_has_module and k.startswith('module.'):
+                    name = k[7:]  # 去掉权重的前缀以匹配普通模型
+                else:
+                    name = k
+                new_state_dict[name] = v
+            return new_state_dict
+
+        # 依次加载各个模块
+        patch_encoder.load_state_dict(fix_state_dict(checkpoint["patch_encoder"], patch_encoder))
+        patch_decoder.load_state_dict(fix_state_dict(checkpoint["patch_decoder"], patch_decoder))
+        curve_encoder.load_state_dict(fix_state_dict(checkpoint["curve_encoder"], curve_encoder))
+        curve_decoder.load_state_dict(fix_state_dict(checkpoint["curve_decoder"], curve_decoder))
+        
+            
+        if args.add_data_mode: 
+            if rank == 0:
+                logger.info("Add-Data Mode: Resetting optimizer and epoch count.")
+        else:
+            patch_optimizer.load_state_dict(checkpoint["patch_optimizer"])
+            curve_optimizer.load_state_dict(checkpoint["curve_optimizer"])
+            if "scaler" in checkpoint and config.USE_AMP:
+                scaler.load_state_dict(checkpoint["scaler"])
+            start_epoch = checkpoint["epoch"] + 1
     
+    patch_optimizer.zero_grad(set_to_none=True)
+    curve_optimizer.zero_grad(set_to_none=True)
+
     best_val_loss = float("inf")
     cur_epochs = start_epoch
     
@@ -839,7 +877,7 @@ def train_pipeline(rank, num_gpus, args, config):
         if rank == 0:
             logger.info(f"Epoch {epoch+1} - KL Weight: {current_kl_weight:.6f}")
         
-        if distribute_sampler is not None:
+        if distribute_sampler is not None and hasattr(distribute_sampler, "set_epoch"):
             distribute_sampler.set_epoch(cur_epochs)
         
         patch_encoder.train()
@@ -863,115 +901,102 @@ def train_pipeline(rank, num_gpus, args, config):
                 if distribute_sampler is not None:
                     distribute_sampler.set_epoch(cur_epochs)
             
-            # 关键优化：数据已在Dataset中预处理，这里只需移动到GPU
-            processed_curves, processed_patches, _ = data_item
+            processed_curves, processed_patches = data_item
             processed_curves = move_to_device(processed_curves, device)
             processed_patches = move_to_device(processed_patches, device)
             
-            # 处理patch
+            # 1. 运行 Encoder
+            # ================= 1. Forward Encoders =================
+            z_p, mean_p, logvar_p = None, None, None
             if processed_patches is not None:
-                try:
-                    with autocast() if config.USE_AMP else torch.cuda.amp.autocast(enabled=False):
-                        mean_p, logvar_p = patch_encoder(
-                            processed_patches["patch_points"], 
-                            processed_patches["patch_normals"], 
-                            processed_patches["u_closed"], 
-                            processed_patches["v_closed"], 
-                            processed_patches["labels"], 
-                            processed_patches["scale"], 
-                            processed_patches["center"], 
-                            processed_patches["mask"]
-                        )
-                        std_p = torch.exp(0.5 * logvar_p).clamp(min=1e-8, max=10)
-                        eps_p = torch.randn_like(std_p)
-                        z_p = mean_p + eps_p * std_p
-                        pred_patch = patch_decoder(z_p)
-                        target_patch = {
-                            "points": processed_patches["patch_points"], 
-                            "normals": processed_patches["patch_normals"], 
-                            "u_closed": processed_patches["u_closed"], 
-                            "v_closed": processed_patches["v_closed"], 
-                            "labels": processed_patches["labels"], 
-                            "scale": processed_patches["scale"], 
-                            "center": processed_patches["center"]
-                        }
-                        patch_losses = compute_patch_vae_loss(pred_patch, target_patch, mean_p, logvar_p, processed_patches["mask"], current_kl_weight, config)
-                    
-                    loss = patch_losses["total"] / config.GRADIENT_ACCUMULATION_STEPS
-                    if torch.isnan(loss) or torch.isinf(loss):
-                        if rank == 0:
-                            logger.warning("NaN/Inf in patch loss! Skipping.")
-                    else:
-                        if config.USE_AMP:
-                            patch_scaler.scale(loss).backward()
-                        else:
-                            loss.backward()
-                        patch_loss_acc.add(patch_losses)
-                except RuntimeError as e:
-                    if rank == 0:
-                        logger.error(f"Runtime error in patch: {e}")
-            
-            # 处理curve
+                with torch.amp.autocast('cuda', enabled=config.USE_AMP):
+                    mean_p, logvar_p = patch_encoder(
+                        processed_patches["patch_points"], processed_patches["patch_normals"], 
+                        processed_patches["u_closed"], processed_patches["v_closed"], 
+                        processed_patches["labels"], processed_patches["scale"], 
+                        processed_patches["center"], processed_patches["mask"]
+                    )
+                    std_p = torch.exp(0.5 * logvar_p).clamp(min=1e-8, max=10)
+                    eps_p = torch.randn_like(std_p)
+                    z_p = mean_p + eps_p * std_p
+
+            z_c, mean_c, logvar_c = None, None, None
             if processed_curves is not None:
-                try:
-                    with autocast() if config.USE_AMP else torch.cuda.amp.autocast(enabled=False):
-                        mean_c, logvar_c = curve_encoder(
-                            processed_curves["curve_points"], 
-                            processed_curves["endpoints"], 
-                            processed_curves["is_closed"], 
-                            processed_curves["labels"], 
-                            processed_curves["scale"], 
-                            processed_curves["center"], 
-                            processed_curves["mask"]
-                        )
-                        std_c = torch.exp(0.5 * logvar_c).clamp(min=1e-8, max=10)
-                        eps_c = torch.randn_like(std_c)
-                        z_c = mean_c + eps_c * std_c
-                        pred_curve = curve_decoder(z_c)
-                        target_curve = {
-                            "points": processed_curves["curve_points"], 
-                            "endpoints": processed_curves["endpoints"], 
-                            "is_closed": processed_curves["is_closed"], 
-                            "labels": processed_curves["labels"], 
-                            "scale": processed_curves["scale"], 
-                            "center": processed_curves["center"]
-                        }
-                        curve_losses = compute_curve_vae_loss(pred_curve, target_curve, mean_c, logvar_c, processed_curves["mask"], current_kl_weight, config)
+                with torch.amp.autocast('cuda', enabled=config.USE_AMP):
+                    mean_c, logvar_c = curve_encoder(
+                        processed_curves["curve_points"], processed_curves["endpoints"], 
+                        processed_curves["is_closed"], processed_curves["labels"], 
+                        processed_curves["scale"], processed_curves["center"], 
+                        processed_curves["mask"]
+                    )
+                    std_c = torch.exp(0.5 * logvar_c).clamp(min=1e-8, max=10)
+                    eps_c = torch.randn_like(std_c)
+                    z_c = mean_c + eps_c * std_c
                     
-                    loss = curve_losses["total"] / config.GRADIENT_ACCUMULATION_STEPS
-                    if torch.isnan(loss) or torch.isinf(loss):
-                        if rank == 0:
-                            logger.warning("NaN/Inf in curve loss! Skipping.")
-                    else:
-                        if config.USE_AMP:
-                            curve_scaler.scale(loss).backward()
-                        else:
-                            loss.backward()
-                        curve_loss_acc.add(curve_losses)
-                except RuntimeError as e:
-                    if rank == 0:
-                        logger.error(f"Runtime error in curve: {e}")
+            # ================= 3. Forward Decoders & Loss =================
+            total_loss = torch.tensor(0.0, device=device)
             
-            # Optimizer步骤
+            # Patch Loss
+            if z_p is not None and processed_patches is not None:
+                with torch.amp.autocast('cuda', enabled=config.USE_AMP):
+                    pred_patch = patch_decoder(z_p)
+                    target_patch = {
+                        "points": processed_patches["patch_points"], 
+                        "normals": processed_patches["patch_normals"], 
+                        "u_closed": processed_patches["u_closed"], 
+                        "v_closed": processed_patches["v_closed"], 
+                        "labels": processed_patches["labels"], 
+                        "scale": processed_patches["scale"], 
+                        "center": processed_patches["center"]
+                    }
+                    patch_losses = compute_patch_vae_loss(pred_patch, target_patch, mean_p, logvar_p, processed_patches["mask"], current_kl_weight, config)
+                    total_loss += patch_losses["total"]
+                    patch_loss_acc.add(patch_losses)
+
+            # Curve Loss
+            if z_c is not None and processed_curves is not None:
+                with torch.amp.autocast('cuda', enabled=config.USE_AMP):
+                    pred_curve = curve_decoder(z_c)
+                    target_curve = {
+                        "points": processed_curves["curve_points"], 
+                        "endpoints": processed_curves["endpoints"], 
+                        "is_closed": processed_curves["is_closed"], 
+                        "labels": processed_curves["labels"], 
+                        "scale": processed_curves["scale"], 
+                        "center": processed_curves["center"]
+                    }
+                    curve_losses = compute_curve_vae_loss(pred_curve, target_curve, mean_c, logvar_c, processed_curves["mask"], current_kl_weight, config)
+                    total_loss += curve_losses["total"]
+                    curve_loss_acc.add(curve_losses)
+            # ================= 4. Backward & Step =================
+            total_loss = total_loss / config.GRADIENT_ACCUMULATION_STEPS
+            
+            if not total_loss.requires_grad:
+                continue
+
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                if rank == 0:
+                    logger.warning("NaN/Inf in total loss!")
+                patch_optimizer.zero_grad(set_to_none=True)
+                curve_optimizer.zero_grad(set_to_none=True)
+                continue
+
+            scaler.scale(total_loss).backward()
+            
             if (batch_idx + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
-                if config.USE_AMP:
-                    patch_scaler.unscale_(patch_optimizer)
-                    torch.nn.utils.clip_grad_norm_(patch_params, max_norm=config.GRAD_CLIP_NORM)
-                    patch_scaler.step(patch_optimizer)
-                    patch_scaler.update()
-                    
-                    curve_scaler.unscale_(curve_optimizer)
-                    torch.nn.utils.clip_grad_norm_(curve_params, max_norm=config.GRAD_CLIP_NORM)
-                    curve_scaler.step(curve_optimizer)
-                    curve_scaler.update()
-                else:
-                    torch.nn.utils.clip_grad_norm_(patch_params, max_norm=config.GRAD_CLIP_NORM)
-                    patch_optimizer.step()
-                    torch.nn.utils.clip_grad_norm_(curve_params, max_norm=config.GRAD_CLIP_NORM)
-                    curve_optimizer.step()
+                scaler.unscale_(patch_optimizer)
+                scaler.unscale_(curve_optimizer)
+                # scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(all_params, max_norm=config.GRAD_CLIP_NORM)
                 
-                patch_optimizer.zero_grad()
-                curve_optimizer.zero_grad()
+                scaler.step(patch_optimizer)
+                scaler.step(curve_optimizer)
+                # scaler.step(optimizer)
+                scaler.update()
+                
+                patch_optimizer.zero_grad(set_to_none=True)
+                curve_optimizer.zero_grad(set_to_none=True)
+                # optimizer.zero_grad(set_to_none=True)
             
             if rank == 0 and (batch_idx + 1) % 100 == 0:
                 patch_avgs = patch_loss_acc.get_averages()
@@ -1019,7 +1044,7 @@ def train_pipeline(rank, num_gpus, args, config):
                 val_loss = val_metrics.get("patch", {}).get("recon_error", 0) + val_metrics.get("curve", {}).get("recon_error", 0)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    torch.save({
+                    checkpoint = {
                         "epoch": epoch, 
                         "patch_encoder": patch_encoder.state_dict(), 
                         "patch_decoder": patch_decoder.state_dict(), 
@@ -1027,21 +1052,25 @@ def train_pipeline(rank, num_gpus, args, config):
                         "curve_decoder": curve_decoder.state_dict(), 
                         "patch_optimizer": patch_optimizer.state_dict(), 
                         "curve_optimizer": curve_optimizer.state_dict(),
-                        "val_loss": val_loss
-                    }, os.path.join(args.checkpoint_dir, "best_model.pth"))
+                        "val_loss": val_loss,
+                        "scaler": scaler.state_dict(),
+                    }
+                    torch.save(checkpoint, os.path.join(args.checkpoint_dir, "best_model.pth"))
                     logger.info(f"Best model saved with val_loss: {val_loss:.6f}")
         
         # 定期保存checkpoint
         if rank == 0 and (epoch + 1) % config.SAVE_INTERVAL == 0:
-            torch.save({
+            checkpoint = {
                 "epoch": epoch, 
                 "patch_encoder": patch_encoder.state_dict(), 
                 "patch_decoder": patch_decoder.state_dict(), 
                 "curve_encoder": curve_encoder.state_dict(), 
                 "curve_decoder": curve_decoder.state_dict(), 
                 "patch_optimizer": patch_optimizer.state_dict(), 
-                "curve_optimizer": curve_optimizer.state_dict()
-            }, os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth"))
+                "curve_optimizer": curve_optimizer.state_dict(),
+                "scaler": scaler.state_dict(),
+            }
+            torch.save(checkpoint, os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth"))
     
     if rank == 0:
         wandb.finish()
@@ -1050,12 +1079,8 @@ def parseargs():
     parser = argparse.ArgumentParser("VAE CAD Reconstruction", parents=[get_args_parser()])
     args = parser.parse_args()
     config = Config()
-    if args.use_smoothness_loss:
-        config.USE_SMOOTHNESS_LOSS = True
-        config.CURVE_SMOOTHNESS_TAU = args.curve_smoothness_tau
-        config.PATCH_SMOOTHNESS_TAU = args.patch_smoothness_tau
-        config.SMOOTHNESS_WEIGHT = args.smoothness_weight
     return args, config
+
 
 if __name__ == "__main__":
     num_gpus = torch.cuda.device_count()

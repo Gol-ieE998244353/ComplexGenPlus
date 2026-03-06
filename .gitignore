@@ -38,3 +38,14 @@
 GeometricRefine/build/
 GeometricRefine/Bin/
 GeometricRefine/Lib/
+
+data
+latents
+loop_new
+wandb
+*.sh
+MinkowskiEngine
+experiments
+*.pyc
+*.log
+*.mtl
