@@ -1,13 +1,14 @@
 import numpy as np
 import sys
-try:
-    from numpy import core
-    if 'numpy._core' not in sys.modules:
-        sys.modules['numpy._core'] = core
-    if 'numpy._core.multiarray' not in sys.modules:
-        sys.modules['numpy._core.multiarray'] = core.multiarray
-except ImportError:
-    pass
+# try:
+#     from numpy import core
+#     if 'numpy._core' not in sys.modules:
+#         sys.modules['numpy._core'] = core
+#     if 'numpy._core.multiarray' not in sys.modules:
+#         sys.modules['numpy._core.multiarray'] = core.multiarray
+# except ImportError:
+#     pass
+from numpy import core
 import os
 import torch
 import math
@@ -597,6 +598,92 @@ class ABCDatasetOptimized(Dataset):
         return (locations, features, processed_curves, processed_patches)
 
 
+class MixedABCDataset(Dataset):
+    """Concatenate multiple ABC datasets while keeping source-level metadata for ratio sampling."""
+
+    def __init__(self, data_folders, sampling_weights=None, **dataset_kwargs):
+        if not data_folders:
+            raise ValueError("data_folders must contain at least one dataset folder")
+
+        self.datasets = [ABCDatasetOptimized(folder, **dataset_kwargs) for folder in data_folders]
+        self.data_folders = list(data_folders)
+        self.grouped_indices = []
+        self.index_map = []
+        self.index_list = []
+        self.sample_counts = []
+
+        offset = 0
+        for dataset_id, dataset in enumerate(self.datasets):
+            dataset_indices = list(range(offset, offset + len(dataset)))
+            self.grouped_indices.append(dataset_indices)
+            for local_idx, index_item in enumerate(dataset.index_list):
+                self.index_map.append((dataset_id, local_idx))
+                self.index_list.append(index_item)
+                self.sample_counts.append(index_item.patch_count + index_item.curve_count)
+            offset += len(dataset)
+
+        self.sampling_weights = _normalize_sampling_weights(sampling_weights, len(self.datasets))
+
+    def __len__(self):
+        return len(self.index_map)
+
+    def __getitem__(self, idx):
+        dataset_id, local_idx = self.index_map[idx]
+        return self.datasets[dataset_id][local_idx]
+
+
+def _normalize_sampling_weights(weights, num_groups):
+    if num_groups <= 0:
+        raise ValueError("num_groups must be positive")
+    if weights is None:
+        return [1.0 / num_groups] * num_groups
+    if len(weights) != num_groups:
+        raise ValueError("sampling_weights length must match number of datasets")
+
+    normalized = [float(w) for w in weights]
+    if any(w < 0 for w in normalized):
+        raise ValueError("sampling_weights must be non-negative")
+
+    total = sum(normalized)
+    if total <= 0:
+        raise ValueError("sampling_weights must sum to a positive value")
+    return [w / total for w in normalized]
+
+
+def _compute_group_sample_counts(total_size, sampling_weights):
+    raw_counts = [total_size * weight for weight in sampling_weights]
+    counts = [int(math.floor(count)) for count in raw_counts]
+    remainder = total_size - sum(counts)
+    if remainder > 0:
+        order = sorted(
+            range(len(raw_counts)),
+            key=lambda idx: raw_counts[idx] - counts[idx],
+            reverse=True,
+        )
+        for idx in order[:remainder]:
+            counts[idx] += 1
+    return counts
+
+
+def _sample_grouped_indices(grouped_indices, sampling_weights, total_size, rng, shuffle=True):
+    if total_size <= 0:
+        return []
+
+    sampled_indices = []
+    counts = _compute_group_sample_counts(total_size, sampling_weights)
+    for group_idx, sample_count in enumerate(counts):
+        if sample_count <= 0:
+            continue
+        candidates = grouped_indices[group_idx]
+        if not candidates:
+            raise ValueError(f"Dataset group {group_idx} is empty and cannot be sampled")
+        sampled_indices.extend(rng.choices(candidates, k=sample_count))
+
+    if shuffle:
+        rng.shuffle(sampled_indices)
+    return sampled_indices
+
+
 def collate_function_global_topology(batch_list):
     """
     全局拓扑处理的collate函数 - 支持点云
@@ -825,6 +912,192 @@ class BucketedDynamicBatchSampler(torch.utils.data.Sampler):
         return batch_count
 
 
+class RatioDistributedSampler(torch.utils.data.Sampler):
+    """Distributed sampler that draws samples from multiple datasets using fixed source ratios."""
+
+    def __init__(
+        self,
+        grouped_indices,
+        sampling_weights,
+        num_samples=None,
+        shuffle=True,
+        drop_last=False,
+        seed=0,
+        rank=0,
+        world_size=1,
+    ):
+        self.grouped_indices = [list(group) for group in grouped_indices]
+        self.sampling_weights = _normalize_sampling_weights(sampling_weights, len(self.grouped_indices))
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self.rank = rank
+        self.world_size = world_size
+        self.epoch = 0
+
+        base_num_samples = num_samples
+        if base_num_samples is None:
+            base_num_samples = sum(len(group) for group in self.grouped_indices)
+
+        if drop_last:
+            self.total_size = (base_num_samples // self.world_size) * self.world_size
+        else:
+            self.total_size = int(math.ceil(base_num_samples / float(self.world_size))) * self.world_size
+
+        if self.total_size == 0 and base_num_samples > 0:
+            self.total_size = self.world_size
+
+        self.num_samples = self.total_size // self.world_size if self.world_size > 0 else 0
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        sampled_indices = _sample_grouped_indices(
+            self.grouped_indices,
+            self.sampling_weights,
+            self.total_size,
+            rng,
+            shuffle=self.shuffle,
+        )
+        start = self.rank * self.num_samples
+        end = start + self.num_samples
+        return iter(sampled_indices[start:end])
+
+    def __len__(self):
+        return self.num_samples
+
+
+class RatioBucketedDynamicBatchSampler(torch.utils.data.Sampler):
+    """Bucketed sampler with per-dataset ratio sampling and DDP-safe epoch sizes."""
+
+    def __init__(
+        self,
+        counts,
+        grouped_indices,
+        sampling_weights,
+        batch_size,
+        max_total_items=None,
+        bucket_boundaries=None,
+        shuffle=True,
+        drop_last=False,
+        seed=0,
+        rank=0,
+        world_size=1,
+        num_samples=None,
+    ):
+        self.counts = list(counts)
+        self.grouped_indices = [list(group) for group in grouped_indices]
+        self.sampling_weights = _normalize_sampling_weights(sampling_weights, len(self.grouped_indices))
+        self.batch_size = batch_size
+        self.max_total_items = max_total_items
+        self.boundaries = bucket_boundaries or [10, 30, 60, 100, 200, 400]
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self.rank = rank
+        self.world_size = world_size
+        self.epoch = 0
+
+        base_num_samples = num_samples
+        if base_num_samples is None:
+            base_num_samples = sum(len(group) for group in self.grouped_indices)
+
+        if drop_last:
+            self.total_size = (base_num_samples // self.world_size) * self.world_size
+        else:
+            self.total_size = int(math.ceil(base_num_samples / float(self.world_size))) * self.world_size
+
+        if self.total_size == 0 and base_num_samples > 0:
+            self.total_size = self.world_size
+
+        self.num_samples = self.total_size // self.world_size if self.world_size > 0 else 0
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def _bucket_id(self, count):
+        for i, bound in enumerate(self.boundaries):
+            if count <= bound:
+                return i
+        return len(self.boundaries)
+
+    def _build_rank_indices(self):
+        rng = random.Random(self.seed + self.epoch)
+        sampled_indices = _sample_grouped_indices(
+            self.grouped_indices,
+            self.sampling_weights,
+            self.total_size,
+            rng,
+            shuffle=self.shuffle,
+        )
+        start = self.rank * self.num_samples
+        end = start + self.num_samples
+        return sampled_indices[start:end]
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        indices = self._build_rank_indices()
+
+        buckets = {i: [] for i in range(len(self.boundaries) + 1)}
+        for idx in indices:
+            buckets[self._bucket_id(self.counts[idx])].append(idx)
+        for key in buckets:
+            if self.shuffle:
+                rng.shuffle(buckets[key])
+
+        for key in buckets:
+            bucket = buckets[key]
+            batch = []
+            total = 0
+            while bucket:
+                idx = bucket.pop()
+                cost = max(1, int(self.counts[idx]))
+                if self.max_total_items is not None and batch and total + cost > self.max_total_items:
+                    if not (self.drop_last and self.batch_size and len(batch) < self.batch_size):
+                        yield batch
+                    batch = []
+                    total = 0
+                batch.append(idx)
+                total += cost
+                if self.batch_size is not None and len(batch) >= self.batch_size:
+                    if not (self.drop_last and self.batch_size and len(batch) < self.batch_size):
+                        yield batch
+                    batch = []
+                    total = 0
+            if batch and not (self.drop_last and self.batch_size and len(batch) < self.batch_size):
+                yield batch
+
+    def __len__(self):
+        indices = self._build_rank_indices()
+        if not indices:
+            return 0
+        if self.max_total_items is None:
+            if self.batch_size is None:
+                return len(indices)
+            return int(math.ceil(len(indices) / float(self.batch_size)))
+
+        batch_count = 0
+        total = 0
+        batch_len = 0
+        for idx in indices:
+            cost = max(1, int(self.counts[idx]))
+            if self.batch_size is not None and batch_len >= self.batch_size:
+                batch_count += 1
+                total = 0
+                batch_len = 0
+            if total + cost > self.max_total_items and batch_len > 0:
+                batch_count += 1
+                total = 0
+                batch_len = 0
+            total += cost
+            batch_len += 1
+        if batch_len > 0 and not (self.drop_last and self.batch_size and batch_len < self.batch_size):
+            batch_count += 1
+        return batch_count
+
+
 def data_loader_ABC(data_folder):
     """兼容接口 - 返回惰性索引列表"""
     index_list, _ = build_lazy_index(data_folder)
@@ -839,20 +1112,22 @@ def train_data_loader_clean(batch_size=32, data_folder="data/default/train",
                             with_pointcloud=False, voxel_dim=128, feature_type='global',
                             with_normal=True, pad1s=True,
                             use_bucketed_batch=False, max_total_items=None,
-                            bucket_boundaries=None, shuffle=True):  # 新增：点云相关参数
+                            bucket_boundaries=None, shuffle=True,
+                            data_folders=None, dataset_sampling_weights=None):  # 新增：点云相关参数
     """
     带全局拓扑处理的数据加载器 - 内存优化版 + 点云支持
     """
-    if not os.path.exists(os.path.join(data_folder, "packed")):
-        if rank == 0:
-            os.makedirs(os.path.join(data_folder, "packed"), exist_ok=True)
-            pack_pickle_files(data_folder, os.path.join(data_folder, "packed"))
-        if world_size > 1:
-            import torch.distributed as dist
-            dist.barrier()
-    
-    train_dataset = ABCDatasetOptimized(
-        data_folder,
+    dataset_folders = data_folders or [data_folder]
+    for folder in dataset_folders:
+        if not os.path.exists(os.path.join(folder, "packed")):
+            if rank == 0:
+                os.makedirs(os.path.join(folder, "packed"), exist_ok=True)
+                pack_pickle_files(folder, os.path.join(folder, "packed"))
+            if world_size > 1:
+                import torch.distributed as dist
+                dist.barrier()
+
+    dataset_kwargs = dict(
         random_rotation=rotation_augmentation,
         random_angle=random_angle,
         flag_noise=flag_noise,
@@ -861,27 +1136,51 @@ def train_data_loader_clean(batch_size=32, data_folder="data/default/train",
         flag_grid=flag_grid,
         num_angles=num_angle,
         dim_grid=dim_grid,
-        with_pointcloud=with_pointcloud,  # 新增
-        voxel_dim=voxel_dim,  # 新增
-        feature_type=feature_type,  # 新增
-        with_normal=with_normal,  # 新增
-        pad1s=pad1s  # 新增
+        with_pointcloud=with_pointcloud,
+        voxel_dim=voxel_dim,
+        feature_type=feature_type,
+        with_normal=with_normal,
+        pad1s=pad1s,
     )
+
+    is_mixed_dataset = len(dataset_folders) > 1
+    if is_mixed_dataset:
+        train_dataset = MixedABCDataset(
+            dataset_folders,
+            sampling_weights=dataset_sampling_weights,
+            **dataset_kwargs,
+        )
+    else:
+        train_dataset = ABCDatasetOptimized(dataset_folders[0], **dataset_kwargs)
     
     effective_workers = min(num_workers, 2)
     
     if use_bucketed_batch or max_total_items is not None:
-        counts = [idx.patch_count + idx.curve_count for idx in train_dataset.index_list]
-        batch_sampler = BucketedDynamicBatchSampler(
-            counts,
-            batch_size=batch_size,
-            max_total_items=max_total_items,
-            bucket_boundaries=bucket_boundaries,
-            shuffle=shuffle,
-            drop_last=True,
-            rank=rank,
-            world_size=world_size,
-        )
+        counts = train_dataset.sample_counts if is_mixed_dataset else [idx.patch_count + idx.curve_count for idx in train_dataset.index_list]
+        if is_mixed_dataset:
+            batch_sampler = RatioBucketedDynamicBatchSampler(
+                counts,
+                train_dataset.grouped_indices,
+                train_dataset.sampling_weights,
+                batch_size=batch_size,
+                max_total_items=max_total_items,
+                bucket_boundaries=bucket_boundaries,
+                shuffle=shuffle,
+                drop_last=True,
+                rank=rank,
+                world_size=world_size,
+            )
+        else:
+            batch_sampler = BucketedDynamicBatchSampler(
+                counts,
+                batch_size=batch_size,
+                max_total_items=max_total_items,
+                bucket_boundaries=bucket_boundaries,
+                shuffle=shuffle,
+                drop_last=True,
+                rank=rank,
+                world_size=world_size,
+            )
         train_data = DataLoader(
             train_dataset, batch_sampler=batch_sampler,
             collate_fn=collate_function_global_topology,
@@ -890,10 +1189,20 @@ def train_data_loader_clean(batch_size=32, data_folder="data/default/train",
         )
         return train_data, batch_sampler
 
-    if world_size > 1:
-        train_sampler = DistributedSampler(
-            train_dataset, num_replicas=world_size, rank=rank, shuffle=shuffle, drop_last=True
-        )
+    if is_mixed_dataset or world_size > 1:
+        if is_mixed_dataset:
+            train_sampler = RatioDistributedSampler(
+                train_dataset.grouped_indices,
+                train_dataset.sampling_weights,
+                shuffle=shuffle,
+                drop_last=True,
+                rank=rank,
+                world_size=world_size,
+            )
+        else:
+            train_sampler = DistributedSampler(
+                train_dataset, num_replicas=world_size, rank=rank, shuffle=shuffle, drop_last=True
+            )
         train_data = DataLoader(
             train_dataset, batch_size=batch_size, collate_fn=collate_function_global_topology,
             sampler=train_sampler, num_workers=effective_workers, pin_memory=False,

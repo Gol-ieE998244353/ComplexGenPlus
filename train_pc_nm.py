@@ -143,7 +143,10 @@ def get_args_parser():
     parser.add_argument('--max_training_iterations', default=250001, type=int)
     parser.add_argument('--checkpoint_path', default=None, type=str)
     parser.add_argument('--gpu', default="0,1,2", type=str)
-    parser.add_argument('--add_data_mode', action='store_true', help='Reset optimizer for training with new data')
+    parser.add_argument('--add_data_mode', action='store_true', help='Mix old and new datasets with a sampling ratio when continuing training')
+    parser.add_argument('--old_data_folder', default=None, type=str, help='Original dataset folder used in add_data_mode')
+    parser.add_argument('--new_data_folder', default=None, type=str, help='New dataset folder used in add_data_mode')
+    parser.add_argument('--old_data_ratio', default=0.3, type=float, help='Sampling ratio for old_data_folder when mixing datasets')
     parser.add_argument('--dynamic_batch', action='store_true', help='Enable dynamic bucketed batch sizes')
     parser.add_argument('--bucketed_batch', action='store_true', help='Enable bucketed fixed batch sizes')
     return parser
@@ -728,6 +731,10 @@ def train_pipeline(rank, num_gpus, args, config):
     # 使用优化后的dataloader - 数据已在Dataset中预处理
     use_bucketed = args.dynamic_batch or args.bucketed_batch
     max_total_items = config.MAX_TOTAL_ITEMS if args.dynamic_batch else None
+    mix_data_mode = args.add_data_mode or args.old_data_folder is not None or args.new_data_folder is not None
+
+    if not 0.0 <= args.old_data_ratio <= 1.0:
+        raise ValueError("old_data_ratio must be between 0 and 1")
 
     if args.quicktest:
         train_data, distribute_sampler = train_data_loader_clean(
@@ -766,24 +773,40 @@ def train_pipeline(rank, num_gpus, args, config):
             shuffle=False
         )
     else:
-        train_folder = "data/partial/train" if args.partial else "data/incr"
-        train_data, distribute_sampler = train_data_loader_clean(
-            args.batch_size, 
-            data_folder=train_folder, 
-            rotation_augmentation=args.rotation_augment, 
-            random_angle=args.random_angle, 
-            flag_noise=args.noise, 
-            flag_grid=args.patch_grid, 
-            num_angle=args.num_angles, 
-            dim_grid=args.points_per_patch_dim, 
-            num_workers=2,  # 使用多进程加速数据预处理
-            rank=rank, 
+        train_folder = "data/partial/train" if args.partial else "data/hardmix_v1"
+        train_loader_kwargs = dict(
+            batch_size=args.batch_size,
+            data_folder=train_folder,
+            rotation_augmentation=args.rotation_augment,
+            random_angle=args.random_angle,
+            flag_noise=args.noise,
+            flag_grid=args.patch_grid,
+            num_angle=args.num_angles,
+            dim_grid=args.points_per_patch_dim,
+            num_workers=2,
+            rank=rank,
             world_size=num_gpus,
             use_bucketed_batch=use_bucketed,
             max_total_items=max_total_items,
             bucket_boundaries=config.BUCKET_BOUNDARIES,
-            shuffle=True
+            shuffle=True,
         )
+
+        if mix_data_mode:
+            default_old_folder = "data/partial/train" if args.partial else "data/large/train"
+            old_data_folder = args.old_data_folder or default_old_folder
+            new_data_folder = args.new_data_folder or train_folder
+            sampling_weights = [args.old_data_ratio, 1.0 - args.old_data_ratio]
+            train_loader_kwargs["data_folders"] = [old_data_folder, new_data_folder]
+            train_loader_kwargs["dataset_sampling_weights"] = sampling_weights
+            if rank == 0:
+                logger.info(
+                    f"Add-Data Mode: mixing old/new datasets with ratio {args.old_data_ratio:.3f}/{1.0 - args.old_data_ratio:.3f}"
+                )
+                logger.info(f"Old dataset: {old_data_folder}")
+                logger.info(f"New dataset: {new_data_folder}")
+
+        train_data, distribute_sampler = train_data_loader_clean(**train_loader_kwargs)
         # Validation data（不使用augmentation）
         val_folder = "data/partial/val" if args.partial else "data/large/val"
         val_data, val_sampler = train_data_loader_clean(
@@ -856,15 +879,14 @@ def train_pipeline(rank, num_gpus, args, config):
         curve_decoder.load_state_dict(fix_state_dict(checkpoint["curve_decoder"], curve_decoder))
         
             
-        if args.add_data_mode: 
-            if rank == 0:
-                logger.info("Add-Data Mode: Resetting optimizer and epoch count.")
-        else:
+        if "patch_optimizer" in checkpoint and "curve_optimizer" in checkpoint:
             patch_optimizer.load_state_dict(checkpoint["patch_optimizer"])
             curve_optimizer.load_state_dict(checkpoint["curve_optimizer"])
-            if "scaler" in checkpoint and config.USE_AMP:
-                scaler.load_state_dict(checkpoint["scaler"])
-            start_epoch = checkpoint["epoch"] + 1
+        if "scaler" in checkpoint and config.USE_AMP:
+            scaler.load_state_dict(checkpoint["scaler"])
+        start_epoch = checkpoint["epoch"] + 1
+        if rank == 0 and mix_data_mode:
+            logger.info("Add-Data Mode: keeping optimizer state and continuing training with mixed old/new data.")
     
     patch_optimizer.zero_grad(set_to_none=True)
     curve_optimizer.zero_grad(set_to_none=True)

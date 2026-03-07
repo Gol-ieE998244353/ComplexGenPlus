@@ -1,2 +1,2 @@
-CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=0,1,2 python3 train_pc_nm.py --experiment_name loop_new_incr  --input_normal_signals --patch_grid  --parsenet --patch_uv --bucketed_batch --max_training_iterations 15000 --batch_size 32 --checkpoint_path 'experiments/loop_new/ckpt/best_model.pth'  
+CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=1 python3 train_pc_nm.py --experiment_name augmented_data_37  --input_normal_signals --patch_grid  --parsenet --patch_uv --bucketed_batch --max_training_iterations 15000 --batch_size 32 --checkpoint_path 'data/vae_ckpt/best_model.pth'
 # --add_data_mode 
